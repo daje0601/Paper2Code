@@ -1,0 +1,190 @@
+🌟 Usage Summary 🌟
+[Planning] Overall plan
+🛠️ Model: o3-mini
+📥 Input tokens: 10872 (Cost: $0.01195920)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 5366 (Cost: $0.02361040)
+💵 Current total cost: $0.03556960
+🪙 Accumulated total cost so far: $0.03556960
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Architecture design
+🛠️ Model: o3-mini
+📥 Input tokens: 3810 (Cost: $0.00419100)
+📦 Cached input tokens: 10752 (Cost: $0.00591360)
+📤 Output tokens: 2051 (Cost: $0.00902440)
+💵 Current total cost: $0.01912900
+🪙 Accumulated total cost so far: $0.05469860
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Logic design
+🛠️ Model: o3-mini
+📥 Input tokens: 16068 (Cost: $0.01767480)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 1973 (Cost: $0.00868120)
+💵 Current total cost: $0.02635600
+🪙 Accumulated total cost so far: $0.08105460
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Configuration file generation
+🛠️ Model: o3-mini
+📥 Input tokens: 16988 (Cost: $0.01868680)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 3295 (Cost: $0.01449800)
+💵 Current total cost: $0.03318480
+🪙 Accumulated total cost so far: $0.11423940
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] config.py
+🛠️ Model: o3-mini
+📥 Input tokens: 16188 (Cost: $0.01780680)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 3321 (Cost: $0.01461240)
+💵 Current total cost: $0.03241920
+🪙 Accumulated total cost so far: $0.14665860
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] utils.py
+🛠️ Model: o3-mini
+📥 Input tokens: 183 (Cost: $0.00020130)
+📦 Cached input tokens: 16000 (Cost: $0.00880000)
+📤 Output tokens: 3546 (Cost: $0.01560240)
+💵 Current total cost: $0.02460370
+🪙 Accumulated total cost so far: $0.17126230
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] dataset_loader.py
+🛠️ Model: o3-mini
+📥 Input tokens: 16225 (Cost: $0.01784750)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 3340 (Cost: $0.01469600)
+💵 Current total cost: $0.03254350
+🪙 Accumulated total cost so far: $0.20380580
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] model.py
+🛠️ Model: o3-mini
+📥 Input tokens: 215 (Cost: $0.00023650)
+📦 Cached input tokens: 16000 (Cost: $0.00880000)
+📤 Output tokens: 6355 (Cost: $0.02796200)
+💵 Current total cost: $0.03699850
+🪙 Accumulated total cost so far: $0.24080430
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] trainer.py
+🛠️ Model: o3-mini
+📥 Input tokens: 16216 (Cost: $0.01783760)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 4298 (Cost: $0.01891120)
+💵 Current total cost: $0.03674880
+🪙 Accumulated total cost so far: $0.27755310
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] evaluation.py
+🛠️ Model: o3-mini
+📥 Input tokens: 197 (Cost: $0.00021670)
+📦 Cached input tokens: 16000 (Cost: $0.00880000)
+📤 Output tokens: 4148 (Cost: $0.01825120)
+💵 Current total cost: $0.02726790
+🪙 Accumulated total cost so far: $0.30482100
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] main.py
+🛠️ Model: o3-mini
+📥 Input tokens: 199 (Cost: $0.00021890)
+📦 Cached input tokens: 16000 (Cost: $0.00880000)
+📤 Output tokens: 3549 (Cost: $0.01561560)
+💵 Current total cost: $0.02463450
+🪙 Accumulated total cost so far: $0.32945550
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] config.py
+🛠️ Model: o3-mini
+📥 Input tokens: 17989 (Cost: $0.01978790)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 7249 (Cost: $0.03189560)
+💵 Current total cost: $0.05168350
+🪙 Accumulated total cost so far: $0.38113900
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] utils.py
+🛠️ Model: o3-mini
+📥 Input tokens: 20849 (Cost: $0.02293390)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 6214 (Cost: $0.02734160)
+💵 Current total cost: $0.05027550
+🪙 Accumulated total cost so far: $0.43141450
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] dataset_loader.py
+🛠️ Model: o3-mini
+📥 Input tokens: 22369 (Cost: $0.02460590)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 8510 (Cost: $0.03744400)
+💵 Current total cost: $0.06204990
+🪙 Accumulated total cost so far: $0.49346440
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] model.py
+🛠️ Model: o3-mini
+📥 Input tokens: 7773 (Cost: $0.00855030)
+📦 Cached input tokens: 18688 (Cost: $0.01027840)
+📤 Output tokens: 13038 (Cost: $0.05736720)
+💵 Current total cost: $0.07619590
+🪙 Accumulated total cost so far: $0.56966030
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] trainer.py
+🛠️ Model: o3-mini
+📥 Input tokens: 9659 (Cost: $0.01062490)
+📦 Cached input tokens: 20608 (Cost: $0.01133440)
+📤 Output tokens: 5574 (Cost: $0.02452560)
+💵 Current total cost: $0.04648490
+🪙 Accumulated total cost so far: $0.61614520
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] evaluation.py
+🛠️ Model: o3-mini
+📥 Input tokens: 8170 (Cost: $0.00898700)
+📦 Cached input tokens: 23680 (Cost: $0.01302400)
+📤 Output tokens: 10334 (Cost: $0.04546960)
+💵 Current total cost: $0.06748060
+🪙 Accumulated total cost so far: $0.68362580
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] main.py
+🛠️ Model: o3-mini
+📥 Input tokens: 7594 (Cost: $0.00835340)
+📦 Cached input tokens: 28160 (Cost: $0.01548800)
+📤 Output tokens: 3486 (Cost: $0.01533840)
+💵 Current total cost: $0.03917980
+🪙 Accumulated total cost so far: $0.72280560
+============================================
+
+🌟 Usage Summary 🌟
+[Evaluation] Transformer - ref_based
+🛠️ Model: o3-mini
+📥 Input tokens: 35688 (Cost: $0.03925680)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 28368 (Cost: $0.12481920)
+💵 Current total cost: $0.16407600
+🪙 Accumulated total cost so far: $0.16407600
+============================================
+

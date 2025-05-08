@@ -1,0 +1,30 @@
+----------------------------------------
+[Implementation approach]
+A lightweight, modular pipeline built entirely on Hugging-Face + Sentence-Transformers + standard Python.  Each stage (loading, chunking, embedding, Bayesian filtering, prompt building, generation, evaluation) is isolated in a single class to simplify unit-testing and reuse.  YAML config is parsed once and injected everywhere via a Config singleton.  All components work on plain Python types (dict, list, torch.Tensor) to avoid custom frameworks.  Optional retrieval can be switched on via config without touching core logic.  CLI entry point (main.py) supports 'hotpot' and 'trivia' sub-commands, writes answers.jsonl and metrics.json.  Everything runs on one GPU but degrades gracefully to CPU.
+
+----------------------------------------
+[File list]
+- main.py
+- config.py
+- dataset_loader.py
+- chunker.py
+- encoder.py
+- bayesian_filter.py
+- prompt_builder.py
+- generator.py
+- evaluation.py
+- retrieval.py
+- utils.py
+
+----------------------------------------
+[Data structures and interfaces]
+classDiagramclass Config {+model_name:str+chunk_size:int+overlap:int+bayes_mu0:float+bayes_sigma0:float+bayes_sigma_obs:float+bayes_beta:float+max_prompt_tokens:int+beam:int+load(path:str)~Config}class DatasetLoader {+__init__(cfg:Config, split:str)+load() -> List[dict]  "[{id, question, context}]" }class Chunker {+__init__(cfg:Config, tokenizer:PreTrainedTokenizerBase)+split(doc:str) -> List[str]}class Encoder {+__init__(cfg:Config)+embed(chunks:List[str]) -> torch.Tensor}class BayesianFilter {+__init__(cfg:Config)+reset()+filter(chunks:List[str], embeds:torch.Tensor) -> List[str]-_update_posterior(x:float)-_accept(x:float) -> bool}class PromptBuilder {+__init__(cfg:Config, tokenizer:PreTrainedTokenizerBase)+build(question:str, accepted_chunks:List[str]) -> str}class Generator {+__init__(cfg:Config)+answer(prompt:str) -> str}class Evaluator {+__init__(cfg:Config)+score(preds:List[str], refs:List[str]) -> dict}class Retrieval {  <<optional>>+__init__(cfg:Config)+index_corpus(corpus_path:str) -> None+retrieve(query:str, k:int) -> List[str]}class SEQAPipeline {+__init__(cfg:Config)+run(sample:dict) -> dict  "{id, pred, ref}"}%% relationshipsSEQAPipeline --> DatasetLoaderSEQAPipeline --> ChunkerSEQAPipeline --> EncoderSEQAPipeline --> BayesianFilterSEQAPipeline --> PromptBuilderSEQAPipeline --> GeneratorSEQAPipeline --> EvaluatorSEQAPipeline --> Retrieval
+
+----------------------------------------
+[Program call flow]
+sequenceDiagramparticipant CLI as main.pyparticipant CF as Configparticipant DL as DatasetLoaderparticipant PP as SEQAPipelineparticipant SN as Chunkerparticipant EN as Encoderparticipant BF as BayesianFilterparticipant PB as PromptBuilderparticipant GN as Generatorparticipant EV as EvaluatorCLI->>CF: cfg = Config.load(yaml)CLI->>DL: dataset = DatasetLoader(cfg, 'validation').load()CLI->>PP: pipeline = SEQAPipeline(cfg)loop samplesCLI->>PP: result = pipeline.run(sample)note right of PP: returns {id,pred,ref}endCLI->>EV: metrics = Evaluator(cfg).score(preds, refs)EV-->>CLI: metrics.json%% internal pipelinePP->>SN: chunks = split(sample.context)SN-->>PP: List[str]PP->>EN: embeds = embed(chunks)EN-->>PP: torch.TensorPP->>BF: accepted_chunks = filter(chunks, embeds)BF-->>PP: List[str]PP->>PB: prompt = build(sample.question, accepted_chunks)PB-->>PP: strPP->>GN: answer = answer(prompt)GN-->>PP: str
+
+----------------------------------------
+[Anything UNCLEAR]
+1) Exact novelty score formula (paper eq.4 contradictory). 2) Should posterior update include rejected chunks? 3) Weighting scheme when updating running context vector. 4) Which sentence-transformer checkpoint did authors use? 5) In TriviaQA, which JSON fields constitute the long context? Clarification will help one-to-one reproduction.
+

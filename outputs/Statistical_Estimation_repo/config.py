@@ -1,0 +1,187 @@
+"""config.py
+
+Centralised, immutable experiment configuration singleton.
+
+Every other module in the code-base *must* import `Config` and access
+hyper-parameters exclusively through its public attributes to ensure that
+all components share the exact same settings dictated by *config.yaml*,
+which reproduces the methodology of the target paper.
+
+Example
+-------
+>>> from config import Config
+>>> cfg = Config.load("config.yaml")
+>>> print(cfg.chunk_size)
+300
+"""
+
+from __future__ import annotations
+
+import pathlib
+import types
+from typing import Any, Dict, Optional
+
+import yaml
+
+
+class _FrozenNamespace(types.SimpleNamespace):
+    """A SimpleNamespace that disallows mutation after freezing."""
+
+    _frozen: bool = False
+
+    def _freeze(self) -> None:  # noqa: D401  (single line imperative)
+        """Freeze the namespace so that attributes become read-only."""
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:  # noqa: D401
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"Attempted to modify read-only config attribute '{name}'."
+            )
+        super().__setattr__(name, value)
+
+
+class Config(_FrozenNamespace):
+    """Experiment-wide configuration loaded from *config.yaml*.
+
+    Public attributes (flat):
+        model_name:            HF model id for the generator (BART).
+        chunk_size:            Max tokens per chunk (M).
+        overlap:               Overlap tokens between successive chunks (O).
+        bayes_mu0:             Prior mean μ₀ for novelty score.
+        bayes_sigma0:          Prior std σ₀  for novelty score.
+        bayes_sigma_obs:       Observation noise σ_obs for novelty score.
+        bayes_beta:            Margin coefficient β  (Eq. 7).
+        max_prompt_tokens:     Encoder maximum tokens (== generator limit).
+        beam:                  Beam size for generation.
+        random_seed:           Global random seed for reproducibility.
+        retrieval_enabled:     Whether retrieval module is active.
+        retrieval_top_k:       Number of passages to retrieve if enabled.
+
+    Additional nested configuration is accessible via `get(path)`.
+    """
+
+    # --------------------------------------------------------------------- #
+    # Class-level singleton management
+    # --------------------------------------------------------------------- #
+    _INSTANCE: Optional["Config"] = None
+
+    # --------------------------------------------------------------------- #
+    # Construction helpers
+    # --------------------------------------------------------------------- #
+    @classmethod
+    def load(cls, yaml_path: str | pathlib.Path = "config.yaml") -> "Config":
+        """Parse *yaml_path* and return (singleton) Config instance.
+
+        The first call creates the singleton; subsequent calls return the
+        cached object regardless of `yaml_path`.
+        """
+        if cls._INSTANCE is not None:
+            return cls._INSTANCE
+
+        path = pathlib.Path(yaml_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        with path.open("r", encoding="utf-8") as fp:
+            raw_cfg: Dict[str, Any] = yaml.safe_load(fp)
+
+        instance = cls()  # create empty namespace
+        instance._populate(raw_cfg)  # type: ignore[attr-defined]
+        instance._freeze()  # type: ignore[attr-defined]
+        cls._INSTANCE = instance
+        return instance
+
+    # --------------------------------------------------------------------- #
+    # Private helpers
+    # --------------------------------------------------------------------- #
+    def _populate(self, src: Dict[str, Any]) -> None:
+        """Validate YAML structure and populate flat attributes."""
+        # ---- Top-level experiment settings ---- #
+        self.random_seed = int(src.get("experiment", {}).get("random_seed", 42))
+
+        # ---- Chunking ---- #
+        chunking = src.get("chunking", {})
+        self.chunk_size = int(chunking.get("chunk_size", 300))
+        self.overlap = int(chunking.get("overlap", 30))
+
+        # ---- Bayesian filter ---- #
+        bf = src.get("bayesian_filter", {})
+        self.bayes_mu0 = float(bf.get("mu0", 0.5))
+        self.bayes_sigma0 = float(bf.get("sigma0", 0.1))
+        self.bayes_sigma_obs = float(bf.get("sigma_obs", 0.05))
+        self.bayes_beta = float(bf.get("beta", 1.0))
+
+        # ---- Generator ---- #
+        gen = src.get("generator", {})
+        self.model_name = str(gen.get("model_name", "facebook/bart-large"))
+        self.beam = int(gen.get("num_beams", 4))
+        self.max_prompt_tokens = int(gen.get("encoder_max_tokens", 1024))
+        self._max_gen_length = int(gen.get("max_generation_length", 128))
+
+        # ---- Retrieval ---- #
+        retrieval = src.get("retrieval", {})
+        self.retrieval_enabled = bool(retrieval.get("enabled", False))
+        self.retrieval_top_k = int(retrieval.get("top_k", 3))
+
+        # ---- Evaluation ---- #
+        evaluation = src.get("evaluation", {})
+        self._metric_names = tuple(evaluation.get("metrics", []))
+
+        # Preserve full raw dict for advanced queries/debugging
+        self._raw = src  # noqa: WPS437  (private attr storing raw)
+
+        # Validate values to catch configuration errors early.
+        self._validate()
+
+    def _validate(self) -> None:
+        """Sanity-check hyper-parameters; raises ValueError if invalid."""
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+        if not (0 <= self.overlap < self.chunk_size):
+            raise ValueError("overlap must be in [0, chunk_size).")
+        if self.bayes_sigma0 <= 0:
+            raise ValueError("bayes_sigma0 must be > 0.")
+        if self.bayes_sigma_obs <= 0:
+            raise ValueError("bayes_sigma_obs must be > 0.")
+        if self.bayes_beta <= 0:
+            raise ValueError("bayes_beta must be > 0.")
+        if self.max_prompt_tokens <= 0:
+            raise ValueError("max_prompt_tokens must be positive.")
+        if self.beam <= 0:
+            raise ValueError("beam must be positive.")
+        if self._max_gen_length <= 0:
+            raise ValueError("max_generation_length must be positive.")
+        if self.retrieval_enabled and self.retrieval_top_k <= 0:
+            raise ValueError("retrieval_top_k must be positive when retrieval is enabled.")
+
+    # --------------------------------------------------------------------- #
+    # Convenience helpers
+    # --------------------------------------------------------------------- #
+    def get(self, dotted_path: str, default: Any = None) -> Any:
+        """Return nested config value via dot-separated `dotted_path`.
+
+        Example
+        -------
+        >>> cfg.get("evaluation.metrics")
+        ['BLEU', 'ROUGE_L', 'BERTScore', 'Perplexity']
+        """
+        parts = dotted_path.split(".")
+        node: Any = self._raw
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    # --------------------------------------------------------------------- #
+    # Dunder methods
+    # --------------------------------------------------------------------- #
+    def __repr__(self) -> str:  # noqa: D401
+        attrs = (
+            "model_name chunk_size overlap bayes_mu0 bayes_sigma0 "
+            "bayes_sigma_obs bayes_beta max_prompt_tokens beam "
+            "retrieval_enabled retrieval_top_k random_seed"
+        ).split()
+        short_cfg = {k: getattr(self, k) for k in attrs}
+        return f"Config({short_cfg})"

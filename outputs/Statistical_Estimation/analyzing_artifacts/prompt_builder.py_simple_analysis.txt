@@ -1,0 +1,101 @@
+prompt_builder.py – Logic Analysis
+----------------------------------
+
+Objective  
+Implement class PromptBuilder conforming exactly to the interface defined in “Data structures and interfaces”:
+
+class PromptBuilder  
+    + __init__(cfg: Config, tokenizer: PreTrainedTokenizerBase)  
+    + build(question: str, accepted_chunks: List[str]) -> str
+
+No additional public methods are allowed.
+
+Key functionalities to cover  
+1. Assemble the textual prompt that will be fed into facebook/bart-large.  
+2. Make sure the total number of tokens (as counted by the SAME tokenizer used by the generator) never exceeds the hard limit given in `config.yaml` under `generator.encoder_max_tokens`.  
+3. If the limit would be exceeded, truncate *only* the context portion (i.e. the list of accepted chunks).  The question and the system / instruction lines must stay intact because they are essential for correct generation.  
+4. Keep the order of accepted chunks (oldest → newest) unless the limit forces truncation.  In that case we drop chunks from the *tail* (i.e. least-recently accepted) so that the model still gets the earliest evidence, which typically contains high-level background information.  This is a deterministic rule and therefore reproducible.  
+5. Edge-case handling: if `accepted_chunks` is empty, insert a default placeholder line (“No additional context was deemed novel.”) so that the prompt structure is always well-formed.  
+6. Implementation must be side-effect free: the method `build()` returns a *python str* object; it does not mutate in-place any argument nor touch global state.  
+7. All numeric constants must come exclusively from `Config` or be fixed textual literals specified by the paper; **never invent hidden magic numbers**.
+
+Detailed step-by-step algorithm
+-------------------------------
+
+Given:
+• cfg: Config instance (singleton)  
+• tokenizer: PreTrainedTokenizerBase already loaded by Generator and passed in (ensures identical token counting).  
+• question: str  
+• accepted_chunks: List[str] (plain text, already filtered by BayesianFilter in original order of acceptance)
+
+Let
+  ROLE_LINE       = "You are a helpful QA system."
+  QUESTION_LINE   = f"The user asks: {question}"
+  CONTEXT_HEADER  = "Below is relevant context filtered from a larger document:"
+  ENDING_LINE     = "Please provide the best possible answer."
+
+Tokenisation helper  
+    def _count_tokens(text: str) -> int:
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+Construction procedure  
+1. Build *fixed* skeleton (header) → HEADER_TEXT =
+        ROLE_LINE + "\n" +
+        QUESTION_LINE + "\n" +
+        CONTEXT_HEADER + "\n"
+
+2. Build *tail* instruction → TAIL_TEXT =
+        "\n" + ENDING_LINE
+
+3. Determine **budget** for context:
+        max_prompt_tokens = cfg.generator.encoder_max_tokens     # 1024 by default
+        header_tokens = _count_tokens(HEADER_TEXT)
+        tail_tokens   = _count_tokens(TAIL_TEXT)
+        budget = max_prompt_tokens - header_tokens - tail_tokens
+   (budget ≥ 0 is guaranteed because encoder_max_tokens in config should be ≥ both header+tail, but assert to be safe)
+
+4. Fill context greedily from `accepted_chunks`
+   INITIALISE: selected_chunks = []; running_len = 0
+   FOR chunk in accepted_chunks:
+        tok_len = _count_tokens(chunk) + 1   # +1 for the “\n” that will join chunks
+        IF running_len + tok_len > budget:
+            BREAK      # stop adding; we have hit the limit
+        selected_chunks.append(chunk)
+        running_len += tok_len
+
+   After the loop:
+       IF selected_chunks is empty:
+            selected_chunks.append("No additional context was deemed novel.")
+
+5. Join everything:
+        context_text = "\n".join(selected_chunks)
+        prompt = HEADER_TEXT + context_text + TAIL_TEXT
+
+6. **Optional sanity check** (useful for unit tests but not mandatory in production):
+        total_tokens = _count_tokens(prompt)
+        assert total_tokens <= max_prompt_tokens, \
+            f"Prompt length {total_tokens} exceeds limit {max_prompt_tokens}"
+
+7. Return `prompt`.
+
+Corner cases & decisions justified against the paper
+----------------------------------------------------
+• Truncation strategy is not specified in the paper; keeping earliest chunks aligns with paper’s emphasis on preserving “continuity across chunk boundaries” (§3.1) and “succinct yet representative context” (§Abstract).  
+• We do **not** attempt to individually truncate long chunks, because chunk size is already tightly bounded at 300 tokens (cfg.chunking.chunk_size). Dropping whole chunks keeps semantic integrity.  
+• The header / tail text exactly mirrors the example wording in §3.3. This maintains faithfulness without introducing new instructions that might bias generation.  
+• We rely on the Config field `generator.encoder_max_tokens`; if a future experiment changes this value, PromptBuilder will automatically respect it without code modification.  
+• No external packages beyond `transformers` are necessary; therefore prompt_builder.py will only `import typing`, `from .config import Config`, and `from transformers import PreTrainedTokenizerBase`.
+
+Unit-test outline (to be placed elsewhere)
+------------------------------------------
+1. With encoder_max_tokens=50, supply 10 dummy chunks each 10 tokens long.  Verify that build() returns a prompt ≤50 tokens and that only first 3-4 chunks are kept.  
+2. With empty accepted_chunks list.  Confirm placeholder text is present and total length ≤ limit.  
+3. High-limit scenario: supply many chunks such that total tokens < limit → assert all chunks appear.  
+
+Integration points
+------------------
+• `Generator` loads the tokenizer and hands it to PromptBuilder (`pipeline` does the wiring).  
+• `BayesianFilter` already outputs accepted_chunks in `List[str]` form.  
+• PromptBuilder is purely string manipulation; no heavy dependencies → minimal overhead in the runtime pipeline.
+
+With this logic analysis, the implementation of prompt_builder.py can proceed directly, guaranteed to satisfy the design contract while adhering strictly to the experimental setup described in the paper and the config.yaml settings.

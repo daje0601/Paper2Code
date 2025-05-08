@@ -1,0 +1,63 @@
+## config.yaml
+training:
+  total_steps: 100000        # For base model training (12 hours on 8 x P100 GPUs)
+  warmup_steps: 4000         # Warmup steps as described in the paper
+  optimizer: adam
+  adam:
+    beta1: 0.9
+    beta2: 0.98
+    epsilon: 1e-9
+  learning_rate_schedule: "d_model^-0.5 * min(step^-0.5, step * warmup_steps^-1.5)"
+  dropout_rate: 0.1          # Dropout rate applied to sub-layer outputs and embeddings
+  batch_tokens: 25000        # Approximate number of source tokens (and target tokens) per batch
+
+model:
+  type: transformer_base
+  d_model: 512               # Dimensionality of model embeddings (for base model)
+  num_layers: 6              # Number of encoder and decoder layers
+  d_ff: 2048                 # Dimensionality of the inner feed-forward layer
+  num_heads: 8               # Number of parallel attention heads
+  d_k: 64                    # Dimension per attention head (d_model / num_heads)
+  d_v: 64                    # Dimension per attention head (d_model / num_heads)
+  positional_encoding: sinusoidal  # Use sinusoidal positional encoding as described in the paper
+  share_embedding: true      # Share embedding weights with pre-softmax linear transformation
+
+inference:
+  beam_size: 4              # Beam search size for translation experiments
+  length_penalty: 0.6       # Length penalty for the beam search
+  max_output_length_offset: 50  # Maximum output length = input length + 50
+
+parsing:
+  model:
+    type: transformer_parsing
+    num_layers: 4                   # 4-layer Transformer for constituency parsing
+    d_model: 1024                   # Model dimensionality for parsing experiments
+  vocab_size:
+    wsj: 16000                    # Vocabulary size for WSJ-only training
+    semi_supervised: 32000        # Vocabulary size for semi-supervised training
+  inference:
+    beam_size: 21
+    length_penalty: 0.3
+    max_output_length_offset: 300     # Maximum output length = input length + 300
+
+data:
+  wmt_2014_en_de:
+    dataset_size: "4.5M sentence pairs"
+    tokenizer: BPE
+    vocab_size: 37000
+  wmt_2014_en_fr:
+    dataset_size: "36M sentence pairs"
+    tokenizer: wordpiece
+    vocab_size: 32000
+  wsj:
+    dataset: "Penn Treebank WSJ"
+    training_size: "40K sentences"
+  semi_supervised_parsing:
+    dataset: "BerkleyParser and high-confidence corpus"
+    training_size: "17M sentences"
+
+hardware:
+  gpus: 8
+  gpu_type: "NVIDIA P100"
+  base_model_training_time: "12 hours"
+  big_model_training_time: "3.5 days"

@@ -1,0 +1,98 @@
+Below is a detailed logic analysis for the config.py module. This file must serve as the single source of truth for all centralized parameters—hyperparameters, file paths, model sizes, dropout rates, optimizer settings, and any other constants. It will parse (or otherwise embed) the contents of the provided YAML configuration (config.yaml) and expose the values in a structured way so that every other module (main.py, dataset_loader.py, model.py, trainer.py, evaluation.py, utils.py) can import and use these settings without discrepancies.
+
+──────────────────────────── Overview ─────────────────────────────
+1. The config.py module should load configuration parameters that cover:
+  • Training details (total training steps, warmup steps, optimizer type and settings, learning rate schedule formula, dropout rate, and batch token counts)
+  • Transformer model hyperparameters for the base translation model (model type, d_model, number of layers, feed-forward inner size, number of attention heads, per-head dimensions d_k and d_v, positional encoding type, and whether to share embedding weights)
+  • Inference parameters for machine translation (beam size, length penalty, maximum output length offset)
+  • Parsing (constituency) experiment parameters: model configuration (number of layers, d_model for the parsing variant), vocabulary sizes (WSJ-only and semi-supervised), and inference beam search settings (beam size, length penalty, maximum output length offset)
+  • Data specifications for each dataset (WMT English–German and English–French, WSJ, and semi-supervised parsing), including details like dataset sizes, tokenization type (BPE or wordpiece), and vocabulary sizes
+  • Hardware details such as the number of GPUs, GPU type, and approximate training times, which might later be used to report training costs or verify scheduling
+
+──────────────────────────── Parameter Details ─────────────────────────────
+A. Training Section:
+ – total_steps: 100000 (for base model training)
+ – warmup_steps: 4000 (used in the learning rate schedule)
+ – optimizer: should be set to “adam”, with nested parameter values:
+  • beta1: 0.9
+  • beta2: 0.98
+  • epsilon: 1e-9
+ – learning_rate_schedule: a string expression representing  
+   d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
+  which will later be used by the Trainer to compute the actual learning rate at each step.
+ – dropout_rate: 0.1 (applied to sub-layer outputs and to the sum of embeddings and positional encodings)
+ – batch_tokens: 25000 (defines an approximate number of tokens per batch for both source and target)
+
+B. Model Section:
+ – type: “transformer_base” (for translation experiments)
+ – d_model: 512 (dimensionality of the embeddings and all internal representations for base model)
+ – num_layers: 6 (number of layers in both the encoder and decoder stacks)
+ – d_ff: 2048 (dimensionality of the inner feed-forward network)
+ – num_heads: 8 (number of parallel attention heads)
+ – d_k and d_v: both 64 (each head’s dimension; derived as d_model/num_heads)
+ – positional_encoding: “sinusoidal” (use sinusoidal positional encodings as described in the paper)
+ – share_embedding: true (this tells the model to use the same weight matrix for input embeddings and the final pre-softmax linear transformation)
+
+C. Inference Section (for Machine Translation):
+ – beam_size: 4 (beam search size when decoding)
+ – length_penalty: 0.6 (used to reweight beams during search)
+ – max_output_length_offset: 50 (maximum output length equals input length plus this offset)
+
+D. Parsing Section:
+ – Under parsing.model:
+  • type: “transformer_parsing”
+  • num_layers: 4 (a smaller stack is used for constituency parsing)
+  • d_model: 1024 (larger representation capacity for parsing experiments)
+ – Under parsing.vocab_size:
+  • wsj: 16000 (vocabulary size for WSJ-only experiments)
+  • semi_supervised: 32000 (for semi-supervised parsing)
+ – Under parsing.inference:
+  • beam_size: 21 (larger beam required for parsing)
+  • length_penalty: 0.3 (different scaling in the decoding for parsing)
+  • max_output_length_offset: 300 (to accommodate longer output sequences from tree linearizations)
+
+E. Data Section:
+ – wmt_2014_en_de:
+  • dataset_size: "4.5M sentence pairs"
+  • tokenizer: “BPE”
+  • vocab_size: 37000
+ – wmt_2014_en_fr:
+  • dataset_size: "36M sentence pairs"
+  • tokenizer: “wordpiece”
+  • vocab_size: 32000
+ – wsj:
+  • dataset: "Penn Treebank WSJ"
+  • training_size: "40K sentences"
+ – semi_supervised_parsing:
+  • dataset: "BerkleyParser and high-confidence corpus"
+  • training_size: "17M sentences"
+
+F. Hardware Section:
+ – gpus: 8
+ – gpu_type: "NVIDIA P100"
+ – base_model_training_time: "12 hours"
+ – big_model_training_time: "3.5 days"
+  • While these may only be used for documentation or logging, they help in verifying that the experiments are run in comparable settings.
+
+──────────────────────────── Role in the Overall System ─────────────────────────────
+• All modules (data loading, model construction, training, inference, and evaluation) will import config.py so that they use exactly the same settings.
+• For instance, the Trainer module will retrieve total_steps, warmup_steps, and optimizer parameters from the config while constructing the Adam optimizer and applying the custom learning rate schedule per the formula.
+• Model construction in model.py will obtain hyperparameters such as d_model, num_layers, d_ff, num_heads, d_k, d_v, and the positional encoding type from config.py.
+• dataset_loader.py will use the data section of the config to decide on tokenization strategy (BPE vs. wordpiece), vocabulary size, and dataset splitting.
+• Evaluation protocols (BLEU for MT and F1 for parsing) in evaluation.py will refer to inference beam size, length penalty, and max output length settings for their respective tasks.
+• Finally, any file paths or additional tuning parameters (if needed in future extensions) can be added to this module to ensure reproducibility.
+
+──────────────────────────── Implementation Considerations ─────────────────────────────
+• The config.py module should provide an interface (e.g., a Config class or a simple dictionary) that makes accessing nested parameters natural (e.g., config["training"]["total_steps"] or config.training.total_steps if using an object-based approach).
+• It must ensure that no module uses “magic numbers” hard-coded in the code. Every parameter must come from this centralized configuration.
+• The configuration parsing process should also include basic validations (for example, ensuring that d_model equals num_heads * d_k) to help catch configuration errors early in the training or model construction pipeline.
+• It is important to preserve the integrity of the design: the configuration is read only once, and all modules use it for consistent behavior across training, data processing, model construction, and evaluation.
+
+──────────────────────────── Summary ─────────────────────────────
+The config.py module must:
+ 1. Load and parse the YAML configuration (or hardcode these settings in a centralized dictionary) exactly as specified in config.yaml.
+ 2. Maintain clear separation of parameters by sections (training, model, inference, parsing, data, hardware).
+ 3. Expose all required hyperparameters, dataset specifications, and hardware details to guarantee that subsequent modules (dataset_loader.py, model.py, trainer.py, and evaluation.py) implement the Transformer and its experiments according to the “Attention Is All You Need” paper.
+ 4. Serve as the single, authoritative source for configuration, ensuring that reproducibility and consistency are maintained across all experimental runs.
+
+This analysis sets a clear blueprint for what config.py will contain and how it will be used throughout the project, faithfully following both the target paper’s methodology and the detailed plan outlined earlier.

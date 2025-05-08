@@ -1,0 +1,61 @@
+----------------------------------------
+[Required packages]
+- python>=3.9
+- torch>=1.13.0
+- transformers>=4.38.0
+- sentence-transformers>=2.5.1
+- datasets>=2.16.0
+- faiss-cpu>=1.7.4  # swap with faiss-gpu if CUDA available
+- numpy>=1.24.0
+- scipy>=1.10.0
+- tqdm>=4.66.0
+- sacrebleu>=2.4.2
+- rouge-score>=0.1.2
+- bert-score>=0.3.13
+- evaluate>=0.4.1
+- pyyaml>=6.0
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['config.py', 'Config: parses YAML/CLI, stores global hyper-parameters. Imported by ALL other modules; must be implemented first.']
+- ['utils.py', 'Common helpers: seed_everything(), flatten_dict(), length_limit(), logging setup. Used by dataset_loader, chunker, evaluation, etc.']
+- ['dataset_loader.py', "DatasetLoader: depends on 'datasets' pkg and Config. Returns List[dict] with keys id, question, context, answer. Provides iter_dataloader() to stream batches."]
+- ['chunker.py', 'Chunker: depends on Config and a Hugging-Face tokenizer passed from Encoder or Generator. Splits long context into fixed-size overlapping chunks; purely CPU string / token ops.']
+- ['encoder.py', 'Encoder: wraps sentence-transformers model; embeds batches of chunks -> torch.Tensor. Exports l2_norm(). Needs Config for model name, device. Depends on utils.seed_everything for deterministic behaviour.']
+- ['bayesian_filter.py', 'BayesianFilter: core novelty logic. Input (chunks, embeddings) → accepted_chunks. Maintains mu, sigma internal state + running context vector. Depends on numpy, torch; imports Config for priors.']
+- ['prompt_builder.py', 'PromptBuilder: tokenises accepted chunks, assembles final prompt, truncates to Config.max_prompt_tokens. Needs generator tokenizer to count tokens; no heavy deps.']
+- ['generator.py', 'Generator: wraps facebook/bart-large (or any HF seq2seq) and performs beam-search generation. Exposes answer(prompt:str)->str. Depends on transformers, Config.']
+- ['retrieval.py', 'Retrieval (optional): FAISS index building + top-k search. Used only when Config.retrieval.enabled is true. Depends on encoder for passage embeddings. Upstream for chunker & filter.']
+- ['evaluation.py', 'Evaluator: BLEU (sacrebleu), ROUGE-L, BERTScore, Perplexity (loads EleutherAI/gpt-neo-125M). Consumes preds & refs. Depends on Config for metric toggles.']
+- ['main.py', 'Entry point CLI. Parses args, loads Config, creates DatasetLoader, SEQAPipeline (defined inside main or utils_pipeline.py) that internally instantiates Chunker, Encoder, Filter, PromptBuilder, Generator. Loops over dataset, writes answers.jsonl, then Evaluation produces metrics.json.']
+
+----------------------------------------
+[Task list]
+- config.py
+- utils.py
+- dataset_loader.py
+- chunker.py
+- encoder.py
+- bayesian_filter.py
+- prompt_builder.py
+- generator.py
+- retrieval.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Config singleton object is imported everywhere to avoid passing long argument lists; utils.logger configured once in main.py. HF tokenizer instance created in generator.py and passed to chunker & prompt_builder to guarantee token count consistency. Embeddings are always l2-normalised torch.FloatTensor; shape (n_chunks, dim). BayesianFilter uses utils.length_limit() to check v_sel is non-zero. Seed for torch, numpy set via utils.seed_everything(seed=Config.seed).
+
+----------------------------------------
+[Anything UNCLEAR]
+Still need confirmation on (1) novelty score formula sign; (2) posterior update policy (all vs accepted chunks); (3) exact fields for TriviaQA long context; (4) sentence-transformer checkpoint name for perfect parity; (5) recommended GPU memory to hold BART + GPT-Neo for parallel scoring.
+

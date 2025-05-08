@@ -1,0 +1,70 @@
+Below is the detailed logic analysis for dataset_loader.py. This module is responsible for bringing raw text data (from both WMT and WSJ sources) into the training pipeline by reading files, tokenizing text with Hugging Face tokenizers, building vocabularies, splitting the data into training/dev/test sets, and finally grouping the tokenized sequences into batches based on an approximate token count (from the configuration). Note that all configuration settings are read from config.py (which imports config.yaml) and common helper functions (e.g., file I/O, logging, tokenizer wrappers, and batch construction) are imported from utils.py.
+
+──────────────────────────── Overview of dataset_loader.py ─────────────────────────────
+1. Import Configuration and Utilities  
+ • Import the centralized configuration (e.g., training parameters, model sizes, data parameters) from config.py.  
+ • Also import any helper functions (such as logging, file reading, and tokenization helper functions) from utils.py.
+
+2. Class Definition: DatasetLoader  
+ • The DatasetLoader class will be initialized with the configuration dictionary.  
+ • Its role:
+  – Read raw text from file paths (for example, for WMT translations and WSJ parsing tasks).
+  – Based on the task (machine translation or constituency parsing), decide which raw files to load.
+  – For translation tasks, load paired data:
+   • One file for the source language and one file for the target language.
+   • (For example, using “wmt_2014_en_de” settings: using BPE with vocab size 37000, or “wmt_2014_en_fr” using wordpiece with vocab size 32000.)  
+  – For parsing tasks, load raw sentences (and possibly tree representations) from the WSJ dataset (or the semi-supervised version).
+
+3. Tokenization Pipeline  
+ • Determine which tokenizer to use:
+  – Access the configuration (config.data.*) to choose between BPE or WordPiece.
+  – Use Hugging Face’s tokenizers (or sentencepiece, depending on the file) to either load a pretrained tokenizer or to train a new one on the training data.
+ • Vocabulary Building:
+  – For translation tasks, if share_embedding is true (as specified in config.model.share_embedding), ensure that the same tokenizer/vocabulary is used for both source and target.
+  – The vocabulary size should be set to the value given in the configuration (e.g., 37000 for wmt_2014_en_de).
+ • Tokenize each sentence (or each sentence pair) into a list of token IDs.
+  – Call the tokenizer’s encode function on each sentence.
+  – Optionally, add special tokens such as start-of-sentence and end-of-sentence markers if required.
+ • Log key information (using utilities) such as vocabulary size and number of tokens processed.
+
+4. Splitting into Training, Validation, and Test Sets  
+ • After reading and tokenizing the full dataset, split the data into three sets.
+  – For the WMT translation experiments, follow common conventions:
+   • Use the majority of the data for training.
+   • Designate known development sets (e.g., newstest2013) as the dev set and separate newstest2014 as the test set.
+  – For the WSJ parsing experiments:
+   • Use the provided 40K sentences of WSJ for training and set aside a development and test split (typically WSJ Section 23 for evaluation).
+  – If using semi-supervised data, merge or create a separate split as needed.
+ • Document any assumptions or delimiters if explicit file splits are not provided in the config.
+
+5. Batch Construction Based on Token Count  
+ • The configuration (config.training.batch_tokens) defines approximately how many source tokens (and target tokens) should be present in a batch.
+ • For each dataset split:
+  – For translation, iterate over the list of tokenized sentence pairs.
+  – For each sentence (or sentence pair), count the tokens. Accumulate sentences until the total count (of source tokens and similarly target tokens) reaches or is close to the configured batch token limit.
+  – Wrap the batch data into a dictionary (or a similar structure) that holds the tokenized sequences (with possible padding) along with any necessary metadata (like sequence lengths).
+ • For parsing tasks, perform a similar batching strategy on the tokenized sentences (and tree-linearized sequences if applicable).  
+ • Log batch information (e.g., number of batches, average tokens per batch) to help with debugging and reproducibility.
+
+6. Handling Edge Cases and Extensions  
+ • As the file format of the dataset may vary, include error handling when reading or tokenizing files.  
+ • For constituency parsing, note that the method to linearize trees into sequences is not defined by the paper. In this module, leave placeholders or configurable options that allow future specification of the linearization strategy (e.g., bracket-based encoding).  
+ • Allow for switching between different datasets (WMT vs. WSJ) based on configuration parameters.
+ • Ensure that once the data is tokenized and batched, it is returned in a format that is compatible with subsequent modules (e.g., Trainer expects a Dataset object that yields dictionaries with token IDs).
+
+7. Returned Data Structure  
+ • The load_data() method should return a tuple: (train_data, dev_data, test_data).  
+ • Each element in the tuple should be in a format that the Trainer class and Evaluation class expect (for example, a list of batch dictionaries or an object with a __getitem__ method).
+
+──────────────────────────── Summary of Key Points ─────────────────────────────
+• Initialize DatasetLoader with configuration from config.py and import helper methods from utils.py.
+• For each dataset (translation and parsing):
+ – Read the raw text data from files (file paths might be provided via additional configuration or assumed defaults).
+ – Choose and configure the Hugging Face tokenizer (BPE for wmt_2014_en_de, wordpiece for wmt_2014_en_fr, etc.) and build the vocabulary with sizes specified (37000, 32000, etc.).
+ – Tokenize each sentence (or sentence pair), adding special tokens as needed.
+ – Split the tokenized examples into training, development, and test sets with known conventions (e.g., using newstest2013 for dev and newstest2014 for test in MT experiments; WSJ splits in parsing).
+ – Construct batches where the total number of tokens approximates config.training.batch_tokens, ensuring that each batch is a dictionary containing the tokenized sequences (and possibly their lengths or masks).
+• Embed logging and error handling to keep track of progress when processing large datasets.
+• Note areas needing clarification (such as the explicit method for tree linearization in parsing and exact file path formats).
+
+This analysis should serve as a complete blueprint for coding dataset_loader.py such that the data loading, tokenization, vocabulary building, splitting, and batching all adhere strictly to the experimental methodology of the Transformer paper and the design details specified in the configuration file.

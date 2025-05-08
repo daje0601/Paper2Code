@@ -1,0 +1,223 @@
+```python
+"""
+main.py – LOGIC ANALYSIS / BLUE-PRINT  *no executable code yet*
+
+The purpose of this file is to map, step-by-step, how the CLI entry
+point orchestrates every module in the architecture specified in the
+design doc.  The real implementation will later replace the “pass” or
+pseudo-code blocks with working code, but **MUST NOT** deviate from the
+data structures, method signatures or the config-driven behaviour that
+have already been finalised.
+
+All decisions, control-flow, object lifetimes, and I/O paths are
+documented here so that coding can proceed mechanically and reviewers /
+collaborators can cross-check that we remain faithful to
+
+    • the research paper’s methodology,
+    • the reproduction plan,
+    • the class/sequence diagrams in “Data structures and interfaces”,
+    • the hyper-parameters in config.yaml.
+
+────────────────────────────────────────────────────────────────────────
+HIGH-LEVEL RESPONSIBILITIES OF main.py
+────────────────────────────────────────────────────────────────────────
+1.  Parse CLI arguments (config path, target dataset, output folder,
+    optional overrides such as --device or --retrieval).
+
+2.  Load YAML into a Config singleton via Config.load().
+    This also exposes every hyper-parameter to the rest of the code.
+
+3.  Call utils.seed_everything(cfg.random_seed) immediately to lock down
+    numpy / torch / random reproducibility.
+
+4.  Instantiate the DatasetLoader for the requested split (“validation”)
+    and dataset name (either “hotpotqa_distractor” or “triviaqa_rc”).
+
+5.  Build the SEQAPipeline object which wires together:
+
+        ┌────────┐
+        │Chunker │  ← receives tokenizer from Generator
+        └────────┘
+             ▲
+             │
+        ┌────────┐
+        │Encoder │  (sentence-transformer)
+        └────────┘
+             ▲
+             │
+        ┌─────────────┐
+        │BayesianFilter│  (keeps state per document)
+        └─────────────┘
+             ▲
+             │
+        ┌──────────────┐
+        │PromptBuilder │  ← same tokenizer instance
+        └──────────────┘
+             ▲
+             │
+        ┌────────┐
+        │Generator│  (facebook/bart-large; owns tokenizer, device)
+        └────────┘
+             ▲
+             │
+        ┌────────────────┐
+        │Retrieval (opt) │  (only if cfg.retrieval.enabled)
+        └────────────────┘
+
+    NOTE:  The pipeline owns **one** tokenizer instance (from
+    Generator) in order to keep token counting consistent between
+    chunking, prompt-building, and generation, as required by the
+    plan.
+
+6.  Iterate through the dataset with tqdm progress bar:
+        for sample in dataset:
+            result = pipeline.run(sample)
+            • result is a dict {id, pred, ref}
+            • Append to in-memory list for later evaluation
+            • Stream write each result as JSONL to
+              f"{out_dir}/answers_{dataset_name}.jsonl"
+      The run() method encapsulates the per-document logic:
+         - chunker.split on sample["context"]
+         - encoder.embed on those chunks
+         - bayesian_filter.filter to pick accepted chunks
+         - prompt_builder.build to get the text prompt
+         - generator.answer(prompt) to generate the answer
+         - (optional) retrieval.retrieve if enabled BEFORE chunking
+      All this follows exactly the sequence diagram in the design.
+
+7.  After finishing the loop call Evaluator.score(preds, refs) to obtain
+    the metrics specified in config["evaluation"]["metrics"]:
+        { "BLEU": value, "ROUGE_L": value, "BERTScore": value,
+          "Perplexity": value }
+
+8.  Serialize the metrics dict to
+        f"{out_dir}/metrics_{dataset_name}.json"
+
+9.  Exit with return code 0 so that shell scripts can detect success.
+
+────────────────────────────────────────────────────────────────────────
+DETAILED FLOW  (corresponds one-to-one with Program call flow diagram)
+────────────────────────────────────────────────────────────────────────
+CLI (argparse)        –->  cfg = Config.load(yaml_path)
+                         └─> utils.seed_everything(cfg.random_seed)
+                         └─> dataset = DatasetLoader(cfg, 'validation').load()
+
+# Instantiate pipeline ONCE – it keeps models on GPU/CPU memory
+                         └─> pipeline = SEQAPipeline(cfg)
+
+LOOP over dataset:
+                         └─> result = pipeline.run(sample)
+                                internally:
+                                   chunks    = Chunker.split(context)
+                                   embeds    = Encoder.embed(chunks)
+                                   accepted  = BayesianFilter.filter(chunks, embeds)
+                                   prompt    = PromptBuilder.build(question, accepted)
+                                   answer    = Generator.answer(prompt)
+                                   return {"id": sample["id"],
+                                           "pred": answer.strip(),
+                                           "ref": sample["answer"]}
+                         └─> write JSONL line, accumulate preds, refs
+
+After loop:            └─> metrics = Evaluator(cfg).score(preds, refs)
+                         └─> json.dump(metrics, metrics_path)
+
+────────────────────────────────────────────────────────────────────────
+IMPORTANT EDGE-CASES & IMPLEMENTATION NOTES
+────────────────────────────────────────────────────────────────────────
+•  Dataset iteration must RE-INITIALISE a fresh BayesianFilter for EACH
+   document (HotpotQA sample == one QA pair with possibly many
+   paragraphs).  State is NOT carried across samples.
+
+•  Device handling:
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     All heavy modules (Encoder, Generator, optional Retrieval) must be
+     moved to that device.  main.py decides the device once and passes
+     it down via Config or constructor arguments (not via global var).
+
+•  Retrieval flag:
+     If cfg.retrieval.enabled is false (default for “SEQA Chunk-Only”)
+     skip *all* Retrieval calls to avoid extra overhead.
+     If true   – instantiate Retrieval once, reuse across samples.
+
+•  Streaming output:
+     The JSONL writer should be opened with buffering to avoid losing
+     data on unexpected crashes.  Consider writing every N lines.
+
+•  Memory:
+     Do **NOT** store tokenised chunks or embeddings for *all* samples
+     at once.  The loop processes and discards per sample.
+
+•  Metrics compute:
+     Evaluator.score expects *lists* of hypothesis strings and
+     reference strings (same ordering).  No tensors are kept.
+
+•  Conformity:
+     All method calls used in main.py **must** exist in the class
+     diagrams under “Data structures and interfaces”.  We explicitly
+     avoid inventing new public methods.
+
+────────────────────────────────────────────────────────────────────────
+CLI SIGNATURE (proposed, still within allowed flexibility)
+────────────────────────────────────────────────────────────────────────
+$ python main.py \
+      --config  config.yaml \
+      --dataset hotpotqa_distractor \
+      --out_dir results/ \
+      [--device cuda:0] \
+      [--retrieve]         # toggles cfg.retrieval.enabled True
+
+The flag “--retrieve” is *only* a convenience to override the YAML;
+internally we update the Config instance after loading YAML but before
+the pipeline is built.
+
+────────────────────────────────────────────────────────────────────────
+MAPPING TO PAPER’S EXPERIMENT SECTION
+────────────────────────────────────────────────────────────────────────
+•  Chunk size / overlap, Bayesian priors, beam-size, gen length,
+   retrieval top-k, encoder max tokens – all read directly from
+   config.yaml → satisfies   “Always reference settings from the
+   config.yaml file. Do not invent or assume any values”.
+
+•  Dataset split – always “validation” as done in the paper.
+
+•  Metrics – Evaluator exactly computes BLEU, ROUGE-L, BERTScore,
+   Perplexity.  EM/F1 can be added later but are not required for core
+   reproduction.
+
+•  Random seed = 42 (default) to keep deterministic behaviour between
+   runs as recommended for reproducibility.
+
+────────────────────────────────────────────────────────────────────────
+FAILURE MODES & PLANNED EXCEPTIONS
+────────────────────────────────────────────────────────────────────────
+•  If prompt token count > cfg.generator.encoder_max_tokens:
+       – PromptBuilder must truncate accepted_chunk list **from the
+         tail** (oldest chunk first) until length fits.
+       – main.py is NOT responsible; PromptBuilder guarantees safety.
+
+•  If GPU OOM when loading Generator:
+       – main.py falls back to cpu by catching the RuntimeError and
+         re-instantiating on “cpu”.  This keeps the program usable on
+         laptops (slow but functional).
+
+•  KeyboardInterrupt during dataset loop:
+       – Ensure open file handles are closed via try/except/finally.
+
+────────────────────────────────────────────────────────────────────────
+CHECKLIST FOR IMPLEMENTATION
+────────────────────────────────────────────────────────────────────────
+☑  argparse wired with defaults from YAML but allows overrides  
+☑  Config singleton accessible via “from config import Config”  
+☑  utils.seed_everything called exactly once  
+☑  DatasetLoader returns list[dict] with {id, question, context, answer}  
+☑  SEQAPipeline.run returns dict with keys id, pred, ref (strict)  
+☑  No layer breaks encapsulation (e.g., main.py never calls internal
+   BayesianFilter methods directly)  
+☑  After loop, Evaluator.score is invoked with *all* preds/refs  
+☑  answers_*.jsonl and metrics_*.json written under out_dir  
+
+────────────────────────────────────────────────────────────────────────
+END OF LOGIC ANALYSIS – main.py
+────────────────────────────────────────────────────────────────────────
+"""
+```

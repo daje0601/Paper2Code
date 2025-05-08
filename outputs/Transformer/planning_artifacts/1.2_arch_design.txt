@@ -1,0 +1,86 @@
+----------------------------------------
+[Implementation approach]
+We will implement a simplified system in Python using open-source libraries such as PyTorch for deep learning and Hugging Face's tokenizers for BPE/WordPiece tokenization. The system is composed of modular components that closely follow the structure of the Transformer: a dataset loader for preparing WMT and WSJ datasets, a Transformer model containing encoder, decoder, multi-head attention, positional encoding, and feed-forward network modules, a training module that implements the Adam optimizer with custom learning rate scheduling (including warmup and decay), dropout regularization, and label smoothing, and an evaluation module to compute BLEU scores for MT and F1 scores for constituency parsing. Configuration parameters are centralized in a configuration file, and the overall design emphasizes clarity and reproducibility.
+
+----------------------------------------
+[File list]
+- main.py
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+- config.py
+- utils.py
+
+----------------------------------------
+[Data structures and interfaces]
+classDiagram
+    class Main {
+        +__init__(config: dict)
+        +run_experiment() -> None
+    }
+    class DatasetLoader {
+        +__init__(config: dict)
+        +load_data() -> Tuple[Dataset, Dataset, Dataset]
+    }
+    class TransformerModel {
+        +__init__(params: dict)
+        +forward(x: Tensor) -> Tensor
+        +train_step(batch: dict) -> dict
+    }
+    class Trainer {
+        +__init__(model: TransformerModel, train_data: Dataset, dev_data: Dataset, config: dict)
+        +train() -> None
+        +save_checkpoint(path: str) -> None
+    }
+    class Evaluation {
+        +__init__(model: TransformerModel, test_data: Dataset, config: dict)
+        +evaluate_mt() -> dict
+        +evaluate_parsing() -> dict
+    }
+    
+    Main --> DatasetLoader : uses
+    Main --> TransformerModel : creates
+    Main --> Trainer : invokes training
+    Main --> Evaluation : calls evaluation
+    Trainer --> TransformerModel : trains
+
+
+----------------------------------------
+[Program call flow]
+sequenceDiagram
+    participant M as Main
+    participant DL as DatasetLoader
+    participant TM as TransformerModel
+    participant TR as Trainer
+    participant EV as Evaluation
+    
+    M->>DL: __init__(config)
+    M->>DL: load_data()
+    DL-->>M: (train_data, dev_data, test_data)
+    
+    M->>TM: __init__(params)
+    M->>TR: __init__(TM, train_data, dev_data, config)
+    M->>EV: __init__(TM, test_data, config)
+    
+    M->>TR: train()
+    TR->>TM: forward(batch) 
+    TM-->>TR: predictions + loss
+    TR->>TM: train_step(batch)
+    TR->>M: save_checkpoint() periodically
+    
+    M->>EV: evaluate_mt()
+    EV->>TM: forward(x) for MT
+    TM-->>EV: predictions
+    EV-->>M: BLEU metrics
+    
+    M->>EV: evaluate_parsing()
+    EV->>TM: forward(x) for parsing
+    TM-->>EV: predictions
+    EV-->>M: F1 score and parsing metrics
+
+
+----------------------------------------
+[Anything UNCLEAR]
+It is unclear how constituency parsing trees should be linearized into a sequence format for training and evaluation. Additionally, the exact dataset file formats and tokenization preprocessing details (such as file encodings and delimiter conventions) need clarification. Further details on some hyperparameters for the parsing model variant (e.g., inner layer size for d_model=1024) would also be beneficial.
+

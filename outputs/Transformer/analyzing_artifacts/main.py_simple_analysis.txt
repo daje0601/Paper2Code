@@ -1,0 +1,78 @@
+// main.py – Logic Analysis
+
+/*
+This file serves as the entry point for the entire experiment workflow. Its core responsibility is to orchestrate the loading of configurations, data, model initialization, training, and evaluations for both the machine translation and constituency parsing experiments as described in the “Attention Is All You Need” paper.
+
+The high-level logic is as follows:
+
+1. Load Configuration:
+   - Import the centralized configuration from config.py.
+   - The configuration parameters (such as training steps, warmup steps, model hyperparameters, dropout rate, beam search settings, etc.) are read from the config.yaml file.
+   - Both the transformer base configuration (for machine translation) and the transformer_parsing configuration (for constituency parsing) are available via the config.
+
+2. Data Loading:
+   - Instantiate the DatasetLoader class with the loaded configuration.
+   - Call the load_data() method, which reads and pre-processes the raw data (WMT for translation and WSJ or augmented corpus for parsing).
+   - The loader performs tokenization (using Hugging Face’s tokenizers for BPE/WordPiece as specified), builds vocabularies, and groups data into batches based on the approximate token count (e.g., 25,000 tokens per batch).
+   - The load_data() method returns a tuple: (train_data, dev_data, test_data).
+
+3. Model Initialization:
+   - Decide which experiment to run (or run both sequentially) based on the configuration. For machine translation, use the “transformer_base” settings (d_model=512, num_layers=6, d_ff=2048, num_heads=8, etc.). For constituency parsing, refer to the “transformer_parsing” section (e.g., a 4-layer Transformer with d_model=1024).
+   - Create an instance of TransformerModel by passing the appropriate hyperparameters from the config.
+   - Note: The model initialization internally builds the encoder, decoder, multi-head attention, positional encoding (sinusoidal by default), and feed-forward networks as outlined in the design. It also handles weight sharing between the token embeddings and the final linear projection if share_embedding is true.
+
+4. Training:
+   - Instantiate the Trainer class with the following dependencies:
+     • The TransformerModel instance.
+     • The training and development data (from the DatasetLoader).
+     • The configuration parameters (which include training.total_steps, warmup_steps, dropout_rate, optimizer configurations, learning rate scheduler formula, and checkpoint saving details).
+   - Call the train() method of Trainer.
+     • In the training loop (within train()), for each batch: 
+         - Perform a forward pass using model.forward(batch).
+         - Compute the loss with label smoothing (ε_ls = 0.1, as specified) and accumulate metrics.
+         - Use the train_step(batch) method of TransformerModel to carry out backpropagation and update weights using the Adam optimizer (with β1 = 0.9, β2 = 0.98, ε = 1e-9) and the learning rate schedule defined by “d_model^-0.5 * min(step^-0.5, step * warmup_steps^-1.5)”.
+         - Periodically, call Trainer.save_checkpoint(path) to persist model checkpoints. The checkpoint frequency is determined by logging intervals (e.g., every 10 minutes) and later used for checkpoint averaging (last 5 for base, last 20 for big model).
+   - Ensure proper logging of training metrics (loss, current learning rate, step count) via utility functions from utils.py.
+
+5. Evaluation:
+   - Upon completing training, instantiate the Evaluation class with:
+     • The trained TransformerModel.
+     • The test data (held-out set from the DatasetLoader).
+     • The configuration (which includes inference parameters such as beam_size, length_penalty, and maximum output length offset for translation, and separate settings for parsing under config.parsing.inference).
+   - Call evaluate_mt():
+     • This method runs the model in inference mode on the machine translation test set.
+     • It performs beam search (with beam_size = 4, length_penalty = 0.6, and max_output_length = input_length + 50) as defined in the config.
+     • The evaluation computes BLEU scores and other translation metrics.
+   - Call evaluate_parsing():
+     • For constituency parsing, the evaluation method applies the parsing-specific beam search (beam_size = 21, length_penalty = 0.3, max_output_length = input_length + 300).
+     • It computes F1 scores and other parsing metrics.
+   - Both evaluation methods utilize model.forward() for inference and helper functions from utils.py for metric computations.
+
+6. Experiment Orchestration:
+   - The main “run_experiment()” function (or analogous main flow) in main.py performs the following steps sequentially:
+     a. Reads the configuration.
+     b. Initializes the DatasetLoader and loads the training, development, and test datasets.
+     c. Instantiates the model based on the selected experiment (machine translation by default, with an optional branch for parsing if required).
+     d. Sets up the Trainer with model and training data, then begins the training process.
+     e. After training completes (with checkpointing and logging in-place), instantiates the Evaluation module.
+     f. Runs the evaluation routines (both evaluate_mt and evaluate_parsing).
+     g. Prints out/logs the final metrics (BLEU for MT, F1 for parsing) along with training statistics.
+
+7. Modular Structure and Reproducibility:
+   - All modules (DatasetLoader, TransformerModel, Trainer, Evaluation) import and use centralized settings from config.py.
+   - Utility functions (from utils.py) are used for logging, checkpoint management, and tokenization to ensure consistency across modules.
+   - The program flow adheres strictly to the design’s Data structures and interfaces:
+         Main → DatasetLoader: uses load_data()
+         Main → TransformerModel: creates and calls forward() and train_step()
+         Main → Trainer: invokes train() and saves checkpoints
+         Main → Evaluation: calls evaluation functions (evaluate_mt and evaluate_parsing)
+   - The logic is optimized for clarity so that each component’s responsibility is clearly separated.
+
+8. Handling Uncertainties:
+   - A clarification is noted: the linearization strategy of constituency parsing trees (i.e., converting tree structures into a sequence for the Transformer) is not fully specified. A provisional strategy may be applied here, with a note to refine or consult additional literature if needed.
+   - File format details and tokenization details for each dataset (WMT, WSJ) are assumed to be handled within DatasetLoader per the configuration settings (e.g., using BPE for WMT_2014_en_de and wordpiece for WMT_2014_en_fr).
+
+In summary, main.py sets up the experiment environment by reading configuration, preparing data, instantiating the model and trainer for the Transformer (both for translation and parsing), executing training with adaptive learning rate and dropout regularization, and finally performing evaluation by computing BLEU and F1 metrics against test sets. This clear, modular, and sequential logic ensures reproducibility and fidelity to the original experimental setup as described in the paper.
+  
+End of Logic Analysis for main.py.
+-->

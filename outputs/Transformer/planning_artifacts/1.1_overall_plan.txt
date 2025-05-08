@@ -1,0 +1,197 @@
+Below is a comprehensive, step‐by‐step plan that captures the key details from the “Attention Is All You Need” paper. This roadmap is intended to guide you in implementing the Transformer from scratch (since no official code is provided) and reproducing both the machine translation and constituency parsing experiments.
+
+──────────────────────────── Result Outline ────────────────────────────
+
+1. Overview and Objectives
+ • Reproduce the Transformer model architecture that relies only on attention mechanisms (no RNNs or convolutions).
+ • Implement and train both a base Transformer (for WMT 2014 English–German/English–French translation) and a variant for English constituency parsing.
+ • Precisely follow the architecture, hyperparameters, training schedules, regularization, and evaluation metrics as described in the paper.
+ • Ensure modular code structure (data processing, model construction, training/inference, and evaluation) for clarity and reproducibility.
+
+──────────────────────────── 2. Methodology Details ─────────────────────────────
+
+A. Transformer Model Architecture
+ 1. Overall Structure
+  – Encoder–decoder framework.
+  – Encoder: Maps input token embeddings (with added positional encodings) to continuous representations.
+  – Decoder: Auto-regressively generates output tokens using a combination of self-attention and encoder–decoder attention.
+
+ 2. Encoder Details
+  – Stack of N = 6 identical layers.
+  – Each layer consists of:
+   a. Multi-head self-attention sub-layer.
+   b. Position-wise feed-forward sub-layer (two linear transformations with a ReLU in between).
+  – Employ residual connections around each sub-layer followed by layer normalization.
+  – All sub-layer outputs and embeddings have dimension d_model = 512 for the base model.
+
+ 3. Decoder Details
+  – Also a stack of N = 6 identical layers.
+  – Contains three sub-layers per layer:
+   a. Masked multi-head self-attention (with causal masking so that position i cannot attend to positions > i).
+   b. Multi-head encoder–decoder attention (queries from the decoder; keys/values from encoder outputs).
+   c. Position-wise feed-forward network.
+  – Use residual connections and layer normalization around each sub-layer.
+
+ 4. Attention Mechanisms
+  – Scaled Dot-Product Attention:
+   • For a set of queries Q, keys K, and values V, compute:
+    score = (Q · K^T) / √(d_k), then apply softmax and multiply by V.
+  – Multi-Head Attention:
+   • Use h = 8 attention heads.
+   • For each head, project Q, K, V using learned matrices to dimensions d_k = d_v = d_model/h = 64.
+   • Concatenate the h outputs and apply a final linear projection.
+  – Note: Verify that the matrix multiplications and scaling follow the paper's description exactly.
+
+ 5. Position-wise Feed-Forward Networks
+  – Consist of two linear layers with a ReLU activation in between.
+  – Input and output dimension is d_model (512 for the base model).
+  – Inner-layer dimension d_ff = 2048.
+  – Applied at each position separately.
+
+ 6. Embeddings and Positional Encoding
+  – Use learned embeddings to convert tokens to vectors of dimension d_model.
+  – Positional encodings are added to the token embeddings at the bottom of both stacks.
+  – Default is sinusoidal encodings:
+   PE(pos, 2i) = sin(pos / (10000^(2i/d_model)))
+   PE(pos, 2i+1) = cos(pos / (10000^(2i/d_model)))
+  – The embeddings for inputs and outputs share the same weight matrix (also used for the final pre-softmax linear transformation), with scaling by √(d_model).
+
+──────────────────────────── 3. Experiments and Training Setup ─────────────────────────────
+
+A. Datasets and Data Processing
+ 1. Machine Translation Experiments
+  – English–German:
+   • Use the WMT 2014 English–German dataset (≈4.5M sentence pairs).
+   • Preprocess using byte-pair encoding (BPE) to create a shared vocabulary of ~37,000 tokens.
+  – English–French:
+   • Use the WMT 2014 English–French dataset (≈36M sentence pairs).
+   • Tokenization based on word-piece with a vocabulary of 32,000 tokens.
+  – Batching:
+   • Group sentence pairs by approximate sequence length.
+   • Each batch should contain roughly 25,000 source tokens and 25,000 target tokens.
+
+ 2. Constituency Parsing Experiments
+  – Use the WSJ portion of the Penn Treebank (≈40K training sentences).
+  – For semi-supervised experiments, supplement with the larger BerkeleyParser and high-confidence data (~17M sentences).
+  – Vocabulary:
+   • Use 16K tokens for WSJ-only experiments.
+   • Use 32K tokens in the semi-supervised setting.
+  – Preprocessing for constituency parsing (tokenization and conversion to a suitable sequence for tree structures) will need an implementation decision.
+   • Note: The paper does not detail the conversion method, so this may require further clarification or additional literature review.
+
+B. Training Details and Hyperparameters
+ 1. Optimizer and Learning Rate Scheduling
+  – Use the Adam optimizer with:
+   • β1 = 0.9, β2 = 0.98, and ϵ = 1e-9.
+  – Learning Rate Schedule:
+   • Increase linearly for the first warmup_steps (4000 steps).
+   • Decrease proportionally to the inverse square root of the step number thereafter.
+   • Formula: lr = d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5)).
+  – Verify that the implementation reflects the “noisy” warmup followed by decay as specified.
+
+ 2. Regularization
+  – Apply dropout:
+   • Residual dropout: Apply dropout (p_drop = 0.1 for the base model) to the output of each sub-layer before adding and normalizing.
+   • Also apply dropout to the sum of the embeddings and positional encodings.
+  – Label Smoothing:
+   • Use label smoothing with ε_ls = 0.1 during training (this is applied when computing the loss).
+  • Note: The big model for the English–French task uses a dropout rate of 0.1 instead of 0.3 as used elsewhere.
+
+ 3. Training Duration and Hardware
+  – For the base model:
+   • Train for 100,000 steps (~12 hours on 8 NVIDIA P100 GPUs; each step ≈0.4 seconds).
+  – For the big model:
+   • Train for 300,000 steps (~3.5 days on 8 P100 GPUs; each step ≈1.0 second).
+  – Implement checkpoint saving (e.g., every 10 minutes) and use checkpoint averaging:
+   • Average the last 5 checkpoints for the base model.
+   • Average the last 20 checkpoints for the big model.
+
+C. Inference and Decoding
+ 1. Beam Search
+  – For machine translation:
+   • Use beam search with a beam size of 4.
+   • Apply a length penalty of α = 0.6.
+   • Set maximum output length to (input length + 50) with early stopping when possible.
+ 2. For Constituency Parsing:
+  – Increase the maximum output length to (input length + 300).
+  – Use a beam size of 21 and a length penalty of α = 0.3.
+  – Note: Tuning these parameters on a validation (development) set is recommended.
+
+──────────────────────────── 4. Implementation Roadmap ─────────────────────────────
+
+Step 1. Environment Setup
+ • Set up a Python environment (e.g., using virtualenv or conda) with deep learning libraries (e.g., TensorFlow or PyTorch).  
+ • Although the original paper mentions tensor2tensor, plan an in-house implementation using preferred frameworks.
+ • Establish reproducibility by fixing random seeds and document versions of all libraries.
+
+Step 2. Data Pipeline Development
+ • Implement tokenization using BPE for EN–DE and word-piece for EN–FR.
+ • Write scripts for reading raw data, applying tokenization, creating vocabulary files, and batching data by approximate sequence length.
+ • For constituency parsing, define any necessary data conversion (e.g., linearization of tree structures) if not clearly specified in the paper.
+
+Step 3. Building the Transformer Components
+ • Implement the Scaled Dot-Product Attention:
+  – Create functions to compute QK^T/sqrt(d_k) followed by softmax and multiplication with V.
+ • Construct Multi-Head Attention:
+  – Write modules for projecting inputs into queries, keys, and values for h attention heads.
+  – Concatenate results and apply a final linear transformation.
+ • Encoder Layer:
+  – Build a module that performs multi-head self-attention followed by a feed-forward network.
+  – Integrate residual connections and layer normalization.
+ • Decoder Layer:
+  – Implement a module that first performs masked multi-head self-attention.
+  – Add encoder–decoder attention and then a feed-forward network.
+  – Again, include residual connections and layer normalization.
+ • Positional Encoding:
+  – Implement the sinusoidal positional encoding as described. Allow for the option to switch to learned positional embeddings (as explored in the experiments).
+ • Embedding Layers:
+  – Create token embedding layers that also tie weights with the final linear projection before softmax.
+
+Step 4. Model Assembly and Training Logic
+ • Assemble the encoder and decoder stacks into a Transformer model.
+ • Implement the learning rate scheduler according to the training formula.
+ • Integrate dropout in every sub-layer as specified.
+ • Include label smoothing in the loss function computation.
+ • Write training loops with checkpointing and logging, including step counts and learning rate reporting.
+ • Code evaluation routines that compute perplexity (during training) and BLEU scores (for translation tasks).
+
+Step 5. Inference Module
+ • Develop a beam search routine that supports variable beam size, length penalty, and early stopping based on maximum output length.
+ • Ensure separate configurations (beam size and penalty) for both translation and parsing tasks.
+
+Step 6. Experiment Management and Reproducibility
+ • Document all hyperparameters used (e.g., d_model, d_ff, number of layers, dropout rate, warmup steps, optimizer parameters).
+ • Implement logging for training progress, checkpoint performance, and evaluation metrics on development/test sets.
+ • Save and later average the required checkpoints.
+ • Create clear experiment scripts to run base models, big models, and constituency parsing experiments.
+
+──────────────────────────── 5. Evaluation Metrics and Experimental Settings ─────────────────────────────
+
+A. Machine Translation
+ • Primary metric: BLEU score measured on newstest sets (newstest2013 for development, newstest2014 for final evaluation).
+ • Record perplexity during training (note: reported perplexities are per wordpiece).
+ • Validate performance against reported scores:
+  – For EN–DE: Base model (≈27.3 BLEU) and Big model (≈28.4 BLEU).
+  – For EN–FR: Base model (≈38.1 BLEU) and Big model (≈41.8 BLEU).
+
+B. Constituency Parsing
+ • Evaluation metric: F1 score on the WSJ Section 23 test set.
+ • Compare your results against prior work; reported F1 scores range from ≈91.3 to >93.0 in various settings.
+ • Note: The experimental details (such as beam search configurations) must be carefully followed (beam size = 21, length penalty = 0.3).
+
+──────────────────────────── 6. Open Questions and Clarifications Needed ─────────────────────────────
+
+• For constituency parsing, the paper briefly mentions “only a small number of experiments” to choose dropouts and learning rates. The exact feed-forward network size (d_ff) for the 4-layer Transformer with d_model=1024 isn’t explicitly stated—consider using a scaling similar to the translation model (possibly d_ff around 4096) or conduct hyperparameter tuning.
+• The method for converting constituency parsing trees to a sequence suitable for the Transformer (and then converting the output back to trees) is not fully described. Decide on an appropriate linearization strategy and verify its validity.
+• Implementation details such as precise checkpoint saving intervals, exact batch construction (tokens vs. sentences), and early stopping criteria for beam search may need further tuning relative to your available compute environment.
+
+──────────────────────────── 7. Final Steps and Next Developments ─────────────────────────────
+
+• Verify the implementation by first training on a small dataset or subset to ensure that the forward/backward passes work properly.
+• Once debugging and unit tests pass, scale training to the full datasets as described.
+• Compare your BLEU scores and perplexities with the results in the paper. Use ablation studies (e.g., alternate numbers of attention heads, changes to dropout rates) to further validate the model components.
+• Document each experiment, the logs, and checkpoint performance for full reproducibility and easier integration into the final code.
+
+──────────────────────────── Conclusion ─────────────────────────────
+
+This plan breaks down the key aspects of both the methodology and experiments in “Attention Is All You Need.” Following this roadmap will facilitate writing modular, well-structured code that reflects the detailed experimental setup in the paper. Where details are ambiguous (e.g., constituency parsing linearization or the exact d_ff for d_model=1024), note these and perform preliminary experiments or consult additional literature for guidance. This thorough strategy should serve as a strong foundation for the final implementation.

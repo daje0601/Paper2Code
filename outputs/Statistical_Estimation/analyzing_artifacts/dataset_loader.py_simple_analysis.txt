@@ -1,0 +1,263 @@
+dataset_loader.py  ‑ Logic Analysis
+================================================
+
+Objective  
+---------  
+Implement a DatasetLoader class that serves a *single* responsibility: load and standardise QA samples coming from Hugging-Face datasets so the rest of the pipeline can operate without caring about dataset-specific quirks.  It must:
+
+1. Use configuration values from `Config` (parsed from `config.yaml`) – **never hard-code** dataset names or paths.  
+2. Return samples in the canonical Python dict format:  
+
+   ```python
+   {
+       "id": str,           # unique question ID
+       "question": str,     # natural-language query
+       "context": str,      # very long document(s) merged into one
+       "answer": str        # reference answer string (first answer if list)
+   }
+   ```  
+
+3. Provide:
+   • `load()`    → returns `List[dict]` (eager) *or*  
+   • `iter_dataloader(batch_size=1, shuffle=False)` → generator / iterator (streaming)  
+
+   The streaming iterator is crucial for low-RAM machines because contexts can be >50K tokens.
+
+4. Support at least the two datasets used in the paper:
+
+   a. `hotpotqa_distractor` (validation split)  
+   b. `triviaqa_rc`        (validation split)
+
+   Future datasets can be added with minimal code changes.
+
+--------------------------------------------------------------------
+Key Design Decisions
+--------------------------------------------------------------------
+
+A.  How to identify dataset & split  
+   *Config* will store *string keys* exactly matching HF hub identifiers:  
+
+   ```
+   experiment.datasets:
+     - hotpotqa_distractor
+     - triviaqa_rc
+   ```
+
+   We parse each key into  
+   • `base_name`   – e.g. "hotpot_qa" or "trivia_qa"  
+   • `config_name` – e.g. "distractor" or "rc"  
+   Mapping logic will live in a small registry dict inside DatasetLoader:
+
+   ```python
+   _DATASET_REGISTRY = {
+       "hotpotqa_distractor": {
+           "hf_name": "hotpot_qa",
+           "hf_config": "distractor",
+           "split": "validation",
+           "parser": _parse_hotpot            # dataset-specific function
+       },
+       "triviaqa_rc": {
+           "hf_name": "trivia_qa",
+           "hf_config": "rc",
+           "split": "validation",
+           "parser": _parse_trivia
+       }
+   }
+   ```
+
+B.  Parsing rules per dataset  
+   1. HotpotQA / distractor  
+
+      HF fields:  
+      ```
+      {
+          'id': str,
+          'question': str,
+          'context': List[[title:str, paragraph:str]],
+          'answer': str,
+          ...
+      }
+      ```  
+
+      • Merge **all** paragraphs (gold + distractor) in the order provided by dataset.  
+      • Prepend the Wikipedia title before each paragraph to preserve weak structure, e.g.  
+        `"## {title}\n{paragraph}\n\n"`  
+      • Join all into one giant string.  
+      • Return first element of 'answer' if it is a list; else the string itself.
+
+   2. TriviaQA / rc  
+
+      The HF RC split exposes:  
+      ```
+      {
+          'question': str,
+          'answer': {'value': str, ...},
+          'context': List[str]  # may not exist!
+          'search_results': List[{'snippet': str, ...}],
+          'entity_pages': List[{'paragraphs': List[str], ...}]
+      }
+      ```  
+
+      *Ambiguity in the paper:* which context field is used.  
+      Resolution (principle: include **extended snippets**):  
+
+      • If `'context'` key exists and is non-empty → use it.  
+      • Else fallback to `'search_results'` snippets (common in HF processing).  
+      • Else fallback to concatenating all paragraphs from `entity_pages`.  
+
+      Implementation detail:
+
+      ```python
+      def _parse_trivia(example):
+          q = example['question']
+          ans = example['answer']['value'] if isinstance(example['answer'], dict) else example['answer']
+          if example.get('context'):
+              long_doc = "\n\n".join(example['context'])
+          elif example.get('search_results'):
+              long_doc = "\n\n".join(sr['snippet'] for sr in example['search_results'] if sr['snippet'])
+          else:
+              pages = example.get('entity_pages', [])
+              para_list = []
+              for p in pages:
+                  para_list.extend(p.get('paragraphs', []))
+              long_doc = "\n\n".join(para_list)
+          return {'question': q, 'context': long_doc, 'answer': ans, 'id': example.get('id', hash(q))}
+      ```
+
+      We document this choice in README because the paper is silent.
+
+C.  Streaming vs eager loading  
+   • For `iter_dataloader`, we read the HF dataset in *streaming* mode (`datasets.load_dataset(..., streaming=True)`) if `batch_size==1`.  
+   • For eager `load()`, we fully materialise the validation split (≈7k + 11k samples; safe for RAM).
+
+D.  Deterministic shuffling  
+   • We respect `Config.random_seed` when `shuffle=True` by seeding Python `random` & NumPy RNGs.
+
+E.  Field normalisation  
+   • Strip leading/trailing whitespace on `question`, `context`, `answer`.  
+   • Ensure Unicode normalisation (NFC) to avoid later tokenizer surprises.
+
+--------------------------------------------------------------------
+Interface Specification
+--------------------------------------------------------------------
+
+```python
+class DatasetLoader:
+    def __init__(self, cfg: Config, dataset_key: str):
+        """
+        dataset_key – one of the strings in cfg.experiment.datasets
+        """
+        self.cfg = cfg
+        self.meta = _DATASET_REGISTRY[dataset_key]
+
+    def load(self) -> List[Dict[str, str]]:
+        """
+        Return entire split in memory.
+        Raises KeyError if dataset_key unknown.
+        """
+        ...
+
+    def iter_dataloader(self,
+                        batch_size: int = 1,
+                        shuffle: bool = False
+                        ) -> Iterator[List[Dict[str, str]]]:
+        """
+        Streaming iterator that yields lists of length <= batch_size.
+        If shuffle is True it first loads indices into memory, shuffles
+        with cfg.random_seed, then iterates deterministically.
+        """
+        ...
+```
+
+*NB:* The registry parsers (`_parse_hotpot`, `_parse_trivia`, etc.) are implemented as `@staticmethod` or nested functions and are not part of the public interface.
+
+--------------------------------------------------------------------
+Algorithmic Steps (per dataset sample)
+--------------------------------------------------------------------
+
+1. Read raw example from HF dataset.  
+2. Apply dataset-specific parser → canonical dict.  
+3. Optionally validate that `context` length (in characters) > `answer` length to catch parsing errors.  
+4. Yield or append.
+
+--------------------------------------------------------------------
+Edge-case Handling
+--------------------------------------------------------------------
+
+• **Empty or None context** – skip sample and log warning via `utils.logger`.  
+• **Multiple reference answers** – choose first answer; store full list under hidden key `_all_answers` if needed for EM/F1 ablation.  
+• **Overly long strings** – no limit here; truncation handled later by Chunker.  
+• **Encoding errors** – dataset loader enforces `example.encode('utf-8', errors='replace')`.
+
+--------------------------------------------------------------------
+Logging & Monitoring
+--------------------------------------------------------------------
+
+At construction time, log:
+
+```
+Loaded HotpotQA-distractor validation: 7405 samples
+Avg raw context chars: 14532
+```
+
+All warnings/errors also funnel to the central logger.
+
+--------------------------------------------------------------------
+Reproducibility Considerations
+--------------------------------------------------------------------
+
+• The loader does **not** shuffle by default (`shuffle=False`) to guarantee deterministic sample order (important for caching accepted chunk positions later).  
+• When `shuffle=True`, the seed from `cfg.experiment.random_seed` ensures repeatability.
+
+--------------------------------------------------------------------
+Dependencies
+--------------------------------------------------------------------
+
+```python
+from datasets import load_dataset
+import numpy as np, random, typing, itertools
+from .config import Config
+from .utils import logger, seed_everything
+```
+
+No Torch or Transformers dependence here – keeps dataloader lightweight.
+
+--------------------------------------------------------------------
+Validation Tests (unit-tests)
+--------------------------------------------------------------------
+
+1. `assert len(dl.load()) == expected_count` (7405, 11313).  
+2. First sample keys are present and non-empty.  
+3. Context string contains *at least* one newline separator.  
+4. Iterator mode with `batch_size=8` returns exactly `ceil(N/8)` batches.  
+5. Shuffle vs non-shuffle produce different order but same set of ids.
+
+--------------------------------------------------------------------
+Open Issues / Ambiguities Acknowledged
+--------------------------------------------------------------------
+
+1. TriviaQA long context source – we selected a deterministic hierarchy (`context` > `search_results` > `entity_pages`).  Will document for review.  
+2. Names of HF fields can change in future versions; we will pin dataset version (`datasets==2.16.0`) and add graceful fallback logging.  
+3. Some TriviaQA answers are *lists* not dicts; parser must handle both.
+
+--------------------------------------------------------------------
+Interaction with Downstream Modules
+--------------------------------------------------------------------
+
+• Output dict directly consumed by `SEQAPipeline.run(sample)` (main.py).  
+• No tokenisation is done here; that is Chunker’s responsibility.  
+• Id field is propagated to evaluation so prediction files can be matched to refs.
+
+--------------------------------------------------------------------
+Conclusion
+--------------------------------------------------------------------
+
+This logic ensures DatasetLoader is:
+
+• faithful to the paper’s datasets and splits,  
+• agnostic to downstream processing details,  
+• memory-efficient via streaming,  
+• reproducible through Config and seeded shuffling,  
+• extensible to new datasets by adding one registry entry.
+
+All other pipeline components can rely on its strict interface, avoiding any dataset-specific branching elsewhere in the codebase.

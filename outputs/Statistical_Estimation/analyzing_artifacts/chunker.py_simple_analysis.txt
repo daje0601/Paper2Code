@@ -1,0 +1,134 @@
+chunker.py  – Logic Analysis
+==================================================
+
+Objective
+---------
+Provide an implementation blueprint for the `Chunker` class exactly as declared in the **Data structures and interfaces** section:
+
+```python
+class Chunker:
+    +__init__(cfg:Config, tokenizer:PreTrainedTokenizerBase)
+    +split(doc:str) -> List[str]
+```
+
+The module’s sole responsibility is to convert one *very long* document string `doc`
+into an **ordered list of overlapping chunk strings** that satisfy the context-window
+constraints used elsewhere in the pipeline.  
+All numerical hyper-parameters MUST be taken from the `Config` singleton, which in
+turn is filled from `config.yaml` (do *not* hard-code!).
+
+Paper Alignment
+---------------
+The paper fixes:
+• maximum chunk length  `M = 300` tokens  
+• overlap size          `O = 30`  tokens
+
+(section 3.1 and section 4.3).  
+We therefore implement *fixed-size sliding windows*; optional future hooks can later
+swap in the “Adaptive Chunk Sizing” variant, but **for strict reproduction we keep the
+fixed window**.
+
+Tokenisation Policy
+-------------------
+Token counts must match what the downstream BART encoder will later see.  
+Hence:
+
+1. `Chunker` receives a **fully initialised Hugging-Face tokenizer** instance that is
+   *identical* to the one used in `Generator` (`facebook/bart-large`).
+2. We call  
+   `tokenizer.encode(doc, add_special_tokens=False, truncation=False)`  
+   to obtain the **raw token id list**.  
+   • `add_special_tokens=False` because we don’t want `<s>` / `</s>` inflating counts.  
+   • `truncation=False` because we must keep the full document intact before splitting.
+3. Chunk boundaries are determined **in token space**.  After slicing we
+   `tokenizer.decode` each sub-list back into plain text to satisfy the declared
+   return type `List[str]`.
+
+Sliding-Window Algorithm
+------------------------
+```
+step = chunk_size - overlap                     # 270 by default
+tokens = tokenizer.encode(...)                  # len = N
+chunks = []
+for start in range(0, N, step):
+    end = min(start + chunk_size, N)
+    chunk_token_ids = tokens[start:end]
+    chunk_text = tokenizer.decode(
+        chunk_token_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True
+    ).strip()
+    chunks.append(chunk_text)
+    if end == N: break
+```
+
+Edge-Case Handling
+------------------
+1. **Document shorter than one chunk**  
+   • `N <= chunk_size` ⇒ single chunk covering everything.
+2. **Very small residue at the tail**  
+   • Always include the remainder even if it is `< overlap`; ensures full coverage.
+3. **Invalid config** (`overlap >= chunk_size`)  
+   • Raise `ValueError` at `__init__` to fail fast.
+4. **Empty / whitespace-only document**  
+   • Return `[]` (empty list) so caller can decide how to proceed.
+
+Performance Considerations
+--------------------------
+• All operations are pure CPU string / list manipulations; no torch required.  
+• `tokenizer.decode` is the costliest call—when chunking thousands of documents,
+  consider caching, but for reproducibility simplicity > micro-optimisation.  
+• No global state; the class is stateless beyond holding `cfg` & `tokenizer`.
+
+Config Interaction
+------------------
+```
+cfg.chunking.chunk_size   # maps to M
+cfg.chunking.overlap      # maps to O
+```
+Both parameters must be loaded at instantiation and stored as private members
+(e.g., `self._M`, `self._O`) for speed.
+
+Method Contracts
+----------------
+__init__
+```
+def __init__(self, cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    # 1) store tokenizer
+    # 2) read chunk_size and overlap from cfg
+    # 3) basic validation
+```
+
+split
+```
+def split(self, doc: str) -> List[str]:
+    """
+    Parameters
+    ----------
+    doc : str
+        Full raw document text.
+
+    Returns
+    -------
+    List[str]
+        Ordered list of chunk strings, each of which (when fed back
+        through *the same tokenizer*) will produce <= chunk_size tokens.
+    """
+```
+The returned list is guaranteed NOT to contain special tokens or leading/trailing
+whitespace; order is left-to-right, preserving the original narrative flow—crucial
+for later Bayesian novelty logic.
+
+Testing Checklist
+-----------------
+✓  Input length < chunk_size → returns exactly one chunk.  
+✓  len(split(doc)) approx = ceil((N - M) / (M - O)) + 1  (verify).  
+✓  Round-trip property:  
+   `sum(tokenizer(doc_i)) == tokenizer(full_doc)` modulo overlaps.  
+✓  No chunk exceeds `M` tokens (`assert len(tokenizer(c)) <= M`).  
+✓  Overlap tokens between consecutive chunks == `O` except possibly at the edges.
+
+By adhering strictly to this analysis, the resulting `Chunker` module will be
+fully deterministic, match the paper’s specification, and integrate seamlessly
+with the rest of the reproduction pipeline without requiring any further
+design changes.

@@ -1,0 +1,44 @@
+----------------------------------------
+[Required packages]
+- numpy==1.21.0
+- torch==1.9.0
+- tokenizers==0.10.3
+- sentencepiece==0.1.96
+- tqdm==4.62.3
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['config.py', 'Holds centralized configuration parameters (e.g., hyperparameters, file paths, model sizes, dropout rates, optimizer settings). This module is imported by all other parts in order to maintain consistency.']
+- ['utils.py', 'Provides common utility functions such as logging, checkpoint saving/loading, and tokenization helpers. These functions are used across dataset_loader.py, trainer.py, and evaluation.py.']
+- ['dataset_loader.py', 'Defines the DatasetLoader class, which is responsible for reading raw text data (WMT, WSJ), performing tokenization using Hugging Face tokenizers (BPE/WordPiece), building vocabularies, splitting data into training, validation, and test sets, and constructing batches based on token counts. Imports configuration from config.py and utility functions from utils.py.']
+- ['model.py', 'Defines the TransformerModel class along with its submodules: Encoder, Decoder, MultiHeadAttention, PositionalEncoding, and Position-wise FeedForward networks. This file contains all the necessary components to build the attention-based model in accordance with the paper. It exports forward() and train_step() methods for integration with the training process.']
+- ['trainer.py', 'Contains the Trainer class that manages the training loop. It imports the TransformerModel from model.py and DatasetLoader from dataset_loader.py. Implements training steps including forward pass, backpropagation, and optimizer updates using Adam with custom learning rate scheduling, warmup, and decay. Also handles checkpoint saving and logging training metrics via utils.py.']
+- ['evaluation.py', 'Implements the Evaluation class which loads a trained model and evaluates its performance. It computes BLEU scores for machine translation tasks and F1 scores for constituency parsing tasks. Relies on utilities from utils.py for batch processing and metric computations.']
+- ['main.py', 'Serves as the entry point of the application. Orchestrates the complete experiment workflow by reading configuration from config.py, initializing the DatasetLoader, TransformerModel, Trainer, and Evaluation classes, and invoking training and evaluation routines in the correct sequence.']
+
+----------------------------------------
+[Task list]
+- config.py
+- utils.py
+- dataset_loader.py
+- model.py
+- trainer.py
+- evaluation.py
+- main.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Configuration parameters, logging functions, tokenization routines, and checkpoint management logic are shared across modules. All modules import common settings from config.py and helper functions from utils.py to ensure consistency and reproducibility. Model hyperparameters (e.g., d_model, d_ff, number of layers, dropout rates) are centralized and used by both the model and trainer components.
+
+----------------------------------------
+[Anything UNCLEAR]
+Clarification is needed on the exact linearization strategy for constituency parsing trees and the expected dataset file format details. In addition, more details on the specialized hyperparameters for the parsing experiments (e.g., the inner layer size for d_model=1024) and recommended hardware configuration for large-scale experiments would be beneficial.
+

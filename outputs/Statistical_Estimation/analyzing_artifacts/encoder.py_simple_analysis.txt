@@ -1,0 +1,101 @@
+encoder.py – Logic Analysis
+---------------------------------------------------------------
+
+Objective  
+Implement the class `Encoder` that produces L2-normalised vector embeddings for a list of chunk strings.  The class must conform exactly to the interface defined in “Data structures and interfaces”.
+
+Class signature
+---------------
+class Encoder:
+    __init__(cfg: Config)
+    embed(chunks: List[str]) -> torch.Tensor
+
+Key requirements extracted from paper & design
+----------------------------------------------
+1. Sentence encoder (“pre-trained sentence encoder”) is **not** BART; it is a light Semantic encoder used *only* to compute chunk embeddings for Bayesian novelty filtering (§3.1).  
+2. Encoder output dimension *d* is not fixed by the paper; must be whatever the chosen model returns (e.g., 384 for `all-MiniLM-L6-v2`).  
+3. Embeddings **must be L2-normalised** so cosine similarity can be computed by dot product (§3.2, Eq. 4).  
+4. Determinism: use the global random seed (`experiment.random_seed`) via `utils.seed_everything()`.  
+5. Device management: default to CUDA if available, otherwise CPU.  All tensors returned by `embed()` must be on the same device.  
+6. No gradient computation is needed (model is frozen).  `torch.no_grad()` context is therefore mandatory inside `embed()`.  
+7. Batch processing is required for speed; batch size may be made configurable (via a new optional field `encoder_batch_size` in Config or hard-coded 64).  Only **read** existing config values; if none present, fall back to a safe default (cannot invent new mandatory keys).  
+8. The class should expose an **internal helper** `_l2_normalize(tensor)` or a small staticmethod `l2_norm()` if helpful, but such helpers remain private (not part of public interface).  
+9. The `embed()` method must gracefully handle corner cases:  
+   • empty input list → return `torch.empty(0, d)` on the correct device.  
+   • very long list → stream over batches with `tqdm` progress if >1000 but do not introduce new public functions.  
+10. The Encoder should **cache** the underlying HF tokenizer so other components (e.g., Chunker) can use *exactly* the same tokenizer instance if needed, but this must be done via an **attribute**, not a method, to respect the given interface (e.g., `self.tokenizer`).  This does NOT break the “no extra public methods” rule.
+
+Step-by-step internal logic
+---------------------------
+__init__(cfg:Config)
+    1. Store cfg.  
+    2. Call `utils.seed_everything(cfg.random_seed)`.  
+    3. Determine model name:  
+         model_name = cfg.get('sentence_encoder_name', 'sentence-transformers/all-MiniLM-L6-v2')  
+       (We may read this via `getattr(cfg, 'sentence_encoder_name', default)` to avoid requiring a new key.)  
+    4. Select device:  
+         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
+    5. Load SentenceTransformer model:  
+         self.model = SentenceTransformer(model_name, device=self.device)  
+       (SentenceTransformer internally handles tokenizer, model etc.)  
+    6. Optionally expose `self.dim = self.model.get_sentence_embedding_dimension()` for introspection.  
+    7. Nothing else is stored.
+
+embed(chunks:List[str]) -> torch.Tensor
+    • If len(chunks) == 0 → return empty tensor as above.  
+    • Compute embeddings with no_grad:  
+        with torch.no_grad():  
+            embs = self.model.encode(  
+                     chunks,  
+                     batch_size=self.cfg.get('encoder_batch_size', 64),  
+                     convert_to_tensor=True,  
+                     device=self.device,  # ensure correct placement  
+                     normalize_embeddings=False  # we normalise ourselves  
+                 )  
+    • L2-normalise:  
+        embs = torch.nn.functional.normalize(embs, p=2, dim=1)  
+    • Return `embs` (shape [n_chunks, d], dtype float32, device self.device).
+
+Why L2 normalising ourselves?
+The paper’s Eq. 4 explicitly divides by ‖h_k‖‖v_sel‖, and the plan states “We will l2-normalise embeddings once”.
+
+Utility dependency
+------------------
+• `utils.seed_everything()` – makes initialisation deterministic.  
+• `Config` singleton – accessed read-only; we must *not* mutate it.  
+• `torch`, `sentence_transformers`, `tqdm` (for optional progress).
+
+Error handling
+--------------
+• Catch `ImportError` for `sentence_transformers` and raise informative message that the package is in `Required packages`.  
+• Catch `RuntimeError` if CUDA OOM and fall back to CPU (log warning via `utils.logger`).
+
+Unit-test guidelines
+--------------------
+1. Pass in three dummy strings and assert output shape = (3, d) and each row’s L2 norm ≈1.0.  
+2. Pass empty list and check shape (0, d).  
+3. Ensure repeated calls do not change random state or internal model (determinism).
+
+Interactions with other modules
+-------------------------------
+• `bayesian_filter.py` will call cosine similarity via dot product -> works because embeddings are unit-length.  
+• `retrieval.py` (optional) can reuse Encoder to build FAISS index; embeddings should remain on CPU when stored to FAISS.  Provide `.cpu()` conversion in retrieval module, not here.  
+• `chunker.py` may need tokenizer; it can get `encoder.tokenizer` attribute.
+
+Non-negotiables (per design rules)
+----------------------------------
+• Class exposes ONLY `__init__` and `embed`.  Any helpers are *prefixed with underscore* or marked `@staticmethod` internal.  
+• No alteration to data structures or additional public methods.
+
+Performance note
+----------------
+A100 GPU with `all-MiniLM-L6-v2` reaches ~50k chunks/s.  If the user switches to a heavier model (e.g., `multi-qa-MiniLM-L12`), batch_size or device memory must be adjusted; config should permit this.
+
+Logging
+-------
+Use `utils.logger.debug` at three points:  
+1. After model load (log model name and device).  
+2. Before embedding batch (log n_chunks).  
+3. After embedding (log time taken).
+
+This analysis provides all decisions and edge cases required to implement `encoder.py` in compliance with the paper, the design and the config.yaml.

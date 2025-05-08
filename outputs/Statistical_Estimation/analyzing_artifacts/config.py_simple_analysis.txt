@@ -1,0 +1,85 @@
+config.py  ‑ Logic Analysis
+===========================
+
+Role in the system  
+------------------  
+Config is the *first* module that must be imported by every other file so that all runtime parameters (chunk length, Bayesian priors, model names, etc.) are defined **exactly** as in `config.yaml`, i.e. as reported in the paper.  No module is allowed to hard-code a constant: every hyper-parameter must be obtained from this singleton.
+
+Paper traceability  
+------------------  
+• chunk_size, overlap → §3.1 / §4.3  
+• μ₀, σ₀, σ_obs, β     → §3.2 Eq.(7) & §4.3  
+• model_name, num_beams, max_generation_length, encoder_max_tokens → §4.2 / §4.3  
+• retrieval.top_k       → §4.2  
+All of these are **explicitly** provided in `config.yaml`; config.py must forbid inventing anything else.
+
+Key design requirements (from “Data structures and interfaces”)  
+---------------------------------------------------------------  
+class Config  
+    + model_name:str  
+    + chunk_size:int  
+    + overlap:int  
+    + bayes_mu0:float  
+    + bayes_sigma0:float  
+    + bayes_sigma_obs:float  
+    + bayes_beta:float  
+    + max_prompt_tokens:int   ← derived from generator.encoder_max_tokens  
+    + beam:int                ← num_beams  
+    + load(path:str) → Config
+
+Implementation strategy  
+-----------------------  
+
+1. **Singleton pattern**  
+   • class variable `_instance` caches the object returned by `load()` so subsequent `Config()` calls just return the same reference.  
+   • prevents silent divergence if modules import Config at different moments.
+
+2. **YAML parsing** (`pyyaml`)  
+   • `load(path)` reads the YAML file once, stores raw dict.  
+   • Throws `FileNotFoundError` or `KeyError` with *clear* messages if any section/field is missing.  
+
+3. **Attribute mapping & validation**  
+   • Flat public attributes exactly as the interface diagram; values copied from nested dict:  
+       self.chunk_size           = y['chunking']['chunk_size']  
+       self.bayes_mu0            = y['bayesian_filter']['mu0']  
+       … etc.  
+   • `assert` statements (or custom `validate()`) to guarantee:  
+       0 < overlap < chunk_size, σ0>0, σ_obs>0, beta>0, encoder_max_tokens >= chunk_size*2  (paper used 300, 1024 so OK).  
+
+4. **CLI override** (optional but useful)  
+   • `argparse` with `--config` (default `config.yaml`) plus `--set key=value` style overrides.  
+   • Only keys already in YAML may be overridden; extra keys raise an error -> preserves paper fidelity while still allowing ablations.
+
+5. **Exposure of nested sub-configs**  
+   • although public flats already exist, keep the original nested dict in `self.raw` for advanced modules (e.g. `evaluation.py` needs list of metrics).  
+   • provide `get(path:str, default=None)` helper where path is dot-separated (`evaluation.metrics`).
+
+6. **Device, seed and env**  
+   • Not in YAML (paper is silent), but pipeline needs them. Because rule #5 says “Do not invent new public members”, device/seed utilities live in `utils.py`, not in Config, but Config exposes the seed defined in yaml (`experiment.random_seed`) so utils can consume that.
+
+7. **Immutability**  
+   • After `validate()`, freeze attributes via `__setattr__` override to prevent accidental mutation during runtime.
+
+8. **max_prompt_tokens logic**  
+   • The prompt length limit for `PromptBuilder` should be identical to `generator.encoder_max_tokens` by default.  Therefore during `load()` we set  
+        self.max_prompt_tokens = y['generator']['encoder_max_tokens']  
+     so other modules don’t duplicate logic.
+
+Interface compliance check  
+--------------------------  
+All attributes listed in the design diagram are present; extra helpers (`raw`, `get()`) are private or explicitly documented but **not** referenced by other modules in diagrams, so we stay compliant.
+
+Failure modes & logging  
+-----------------------  
+• Any missing field → raise error at startup (fail-fast).  
+• Any attempt to read Config before `Config.load()` is called in `main.py` → raises RuntimeError (“Config not initialised”).  
+• Logging of parsed values (INFO) once, so experiment hyper-parameters are recorded in stdout/stderr logs.
+
+Edge cases addressed  
+--------------------  
+• YAML numbers may load as int or float; casting done explicitly.  
+• If retrieval.enabled == False, retrieval.top_k may still exist; Config keeps it but downstream modules ignore.  
+
+Outcome  
+-------  
+`config.py` delivers a rigorously validated, immutable singleton that exactly mirrors the paper’s hyper-parameters and provides a single point of truth for every other component in the reproduction codebase.

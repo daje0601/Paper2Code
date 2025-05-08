@@ -1,0 +1,200 @@
+REPRODUCTION PLAN  
+Paper: “Statistical Estimation for Large-Scale Question Answering: Inferring Comprehensive Context from Partial Chunks” (ICML 2025)
+
+--------------------------------------------------------------------
+A.  HIGH-LEVEL PIPELINE TO REPRODUCE SEQA
+--------------------------------------------------------------------
+1. Input = (question Q, long document D)  
+2. CHUNKING  →  {C₁ … C_K} (≈300 tok, 30 tok overlap)  
+3. EMBEDDING h_k = ENCODE(C_k)                      (Sentence encoder)  
+4. BAYESIAN THRESHOLDING, online over k = 1…K  
+   • Compute novelty X_k w.r.t. running context vector v_sel  
+   • Update posterior (μ, σ²) of X_k → adaptive threshold τ = μ+βσ  
+   • If X_k ≥ τ → accept chunk, update v_sel, store original text  
+5. Concatenate all accepted chunks → C_final  
+6. PROMPT = [system-role] + question Q + “Context:” + C_final  
+7. Feed PROMPT to generator G = facebook/bart-large ⇒ answer A  
+8. Evaluate A with BLEU, ROUGE-L, BERTScore, Perplexity (GPT-Neo 125 M)  
+(Optionally: EM/F1 for completeness.)  
+
+--------------------------------------------------------------------
+B.  ENVIRONMENT & DEPENDENCIES
+--------------------------------------------------------------------
+Python ≥3.9 | PyTorch ≥1.13 | CUDA 11+  
+huggingface-transformers | sentence-transformers  
+datasets (HF) | faiss-cpu/faiss-gpu (only for retrieval variant)  
+sacrebleu | rouge-score | bert-score | numpy / scipy  
+tqdm, wandb or tensorboard for logging  
+
+--------------------------------------------------------------------
+C.  IMPLEMENTATION DETAIL BY COMPONENT
+--------------------------------------------------------------------
+C-1  Chunk-wise Document Segmentation
+• Tokeniser: SAME as generator (BART-Large tokenizer) to keep token counts consistent.  
+• Parameters (paper’s experiments):  
+  – Max chunk length M = 300 tokens  
+  – Overlap O = 30 tokens  
+  – For first release reproduce with fixed-size chunks; keep hook for future adaptive length heuristics (named-entity density etc.)  
+• Output: list of token id tensors + parallel raw text strings.
+
+C-2  Sentence/Chunk Encoder
+• Paper only says “pre-trained sentence encoder”; not specified.  
+  – Repro choice: ‘sentence-transformers/all-MiniLM-L6-v2’ (768-D; light, GPL-friendly) OR ‘multi-qa-MiniLM-L6-cos-v1’.  
+  – Keep encoder name in config so it can be swapped easily.  
+• Pre-compute h_k on GPU, batch size 32–64 to maximise throughput.  
+• L2-normalise embeddings once to ease cosine similarity.
+
+C-3  Novelty Score
+• Paper’s eq. (4) is ambiguous.  Implement the most standard version:  
+      cos_sim = (h_k · v_sel)/(∥h_k∥ ∥v_sel∥ + ε)  
+      X_k   = 1 – cos_sim              (range ≈ 0…2; high = novel)  
+  – ε = 1e-8 to avoid ÷0.  
+• Special case k = 1 (v_sel = 0): accept first chunk, set v_sel = h₁, record X₁ but skip Bayesian update or treat cos_sim = 0.  
+
+C-4  Bayesian Thresholding
+Prior (paper, §4.3):  
+    μ₀ = 0.5  σ₀ = 0.1  σ_obs² = 0.05  β = 1.0  
+Update (Normal prior, known variance) for every NEW X_k (accepted OR rejected ‑– unclear, we’ll update on every observed score):  
+    σ_post²  = 1 / (1/σ_prior² + 1/σ_obs²)  
+    μ_post   = σ_post² (μ_prior/σ_prior² + X_k/σ_obs²)  
+    Set (μ, σ²) ← (μ_post, σ_post²)  
+Threshold τ_k = μ + β σ.  
+
+Accept if X_k ≥ τ_k.
+
+Open issues / decisions to log:
+• If we update posterior only on accepted chunks vs. all chunks – paper not explicit; will implement both as ablation (flag update_on_all).  
+• The weight update formula in Eq. (8) appears inverted; we will use simple running mean:  
+     v_sel ← (n_sel · v_sel + h_k) / (n_sel + 1)  
+     where n_sel = #accepted so far.  
+  (Alternative weighting with w_k = X_k/(X_k+1) can be toggled).
+
+C-5  Prompt Construction
+Example (paper §3.3).  Exact template to ensure reproducibility:  
+
+“You are a helpful QA system.  
+The user asks: {question}  
+Below is relevant context filtered from a larger document:  
+{concatenated accepted chunk texts}  
+Please provide the best possible answer.”
+
+• Strip excessive newlines; limit final prompt length so that encoder tokens ≤1024 (paper variant) or ≤512 (low-resource).  
+• If accepted chunks overflow limit, truncate oldest or lowest-X_k chunks (paper not precise) – we will truncate from the tail.
+
+C-6  Generator
+• Model: facebook/bart-large (no fine-tuning).  
+• Generation hyper-params (paper §4.3):  
+    max_length = 128   |   num_beams = 4 (use 2 for speed ablation)  
+    early_stopping = True  
+    length_penalty = 1.0  
+    repetition_penalty = 1.0  
+    (no nucleus/temperature sampling in paper).  
+• Use FP16 on GPUs if available for memory.
+
+C-7  Retrieval-Augmented Variant (optional, “SEQA w/Index”)
+• Index corpus (∼Wikipedia dump) with same sentence encoder.  
+• Query embedding = encoder(question).  
+• k = 3 top passages via FAISS (inner product / cosine).  
+• Concatenate three passages into super-document, then apply full chunk→filter pipeline.  
+• Leave exact corpus scope and cleaning explicitly documented (the paper is vague).
+
+--------------------------------------------------------------------
+D.  DATASETS & PRE-PROCESSING
+--------------------------------------------------------------------
+HotpotQA (distractor validation) ‑ 7 405 samples.  
+TriviaQA (RC validation) ‑ 11 313 samples.  
+Steps:  
+1. datasets.load_dataset("hotpot_qa", "distractor")["validation"]  
+   – For each item, take 'context' list of (title, paragraph).  
+     • Merge all distractor and gold paragraphs into one long string  
+     • Preserve order from dataset.  
+2. datasets.load_dataset("trivia_qa", "rc")["validation"]  
+   – Use 'search_results' / 'entity_pages' field; paper is not explicit; simplest: use 'search_results' text list (each ~background). Merge.  
+   – Document any divergence (unclear in paper).  
+3. Save pre-tokenised versions with chunk boundaries for speed.  
+
+--------------------------------------------------------------------
+E.  EVALUATION SUITE
+--------------------------------------------------------------------
+Metrics exactly as in paper (Section 4.4):  
+1. BERTScore (F1)    – model_type='roberta-large', lang='en'  
+2. BLEU              – sacrebleu.corpus_bleu (case-sensitive, tokenize=13a)  
+3. ROUGE-L           – rouge-score (prec/rec/f1; keep f1)  
+4. Perplexity        – GPT-Neo 125M (Eleuther).  
+   • Compute negative log-likelihood per token, exponentiate.  
+   • Needs padding-masked loss.  
+5. (Optional) EM / F1 extractive: string match after normalisation (lower, remove punct, articles).  Not emphasised but useful.
+
+Create evaluation script ‘eval.py’ saving CSV with per-question and aggregate scores.
+
+--------------------------------------------------------------------
+F.  EXPERIMENTAL SETTINGS SUMMARY (FAITHFUL TO PAPER)
+--------------------------------------------------------------------
+Chunk size           M = 300  
+Overlap              O = 30  
+Sentence encoder     all-MiniLM-L6-v2 (overrideable)  
+Bayesian parameters  μ₀=0.5  σ₀=0.1  σ_obs²=0.05  β=1.0  
+Generator            BART-Large, num_beams=4, max_len=128  
+Top-k retrieval      k = 3 (only in “with Index” variant)  
+Encoder limit        512 or 1024 tokens (flag)  
+Batch sizes          embedding 64; generation 8 (GPU A100 40 GB)  
+Random seed          42 for reproducibility  
+
+--------------------------------------------------------------------
+G.  PROJECT STRUCTURE / MODULAR CODE LAYOUT
+--------------------------------------------------------------------
+/seqa_repro  
+│  config.yaml              (default hyper-params)  
+│  run_hotpot.py            (entry point)  
+│  run_trivia.py  
+├─ data/  
+│   download_datasets.py  
+│   preprocess.py           (chunk splitter)  
+├─ models/  
+│   sentence_encoder.py  
+│   bart_generator.py  
+├─ algo/  
+│   bayes_filter.py         (Bayesian update, novelty calc)  
+│   context_selector.py     (orchestrates chunk → accept)  
+├─ retrieval/               (optional)  
+│   build_index.py  
+│   retrieve.py  
+├─ evaluation/  
+│   metrics.py  
+│   evaluate.py  
+└─ utils/ logging, seed, token_utils.py  
+
+--------------------------------------------------------------------
+H.  OPEN / AMBIGUOUS POINTS (DOCUMENT & CHOOSE RESOLUTION)
+--------------------------------------------------------------------
+1. Exact novelty definition ‑ sign inversion & ε value.  
+2. Whether posterior update uses *all* chunks or only accepted ones.  
+3. Weighting rule for v_sel (Eq. 8 contradictory).  
+4. Real sentence encoder name.  
+5. How the HotpotQA long context is ordered (gold first? distractors first?).  
+6. For TriviaQA, which field(s) create the “extended snippet”.  
+7. In retrieval variant, which external corpus.  
+8. Whether final prompt is capped at 512 or 1024 BART encoder tokens.  
+
+We will log every assumption in README and expose them as command-line switches for ablations.
+
+--------------------------------------------------------------------
+I.  VALIDATION & DEBUGGING CHECKLIST
+--------------------------------------------------------------------
+✓ Unit-test Bayesian update with synthetic data.  
+✓ Ensure chunk tokens really adhere to 300/30.  
+✓ Verify accepted-chunk percentage (expect 10–40 % per paper).  
+✓ Track running τ and X_k during a sample document to confirm adaptation.  
+✓ Check prompt length distribution; truncate if needed.  
+✓ Reproduce a small toy dataset first (e.g., 100 QA pairs) to benchmark speed.  
+✓ Compare our BERTScore ranges with those in Table 1 (≈0.75–0.81).  
+
+--------------------------------------------------------------------
+J.  FINAL DELIVERABLES
+--------------------------------------------------------------------
+• End-to-end scripts: run_hotpot.sh, run_trivia.sh  
+• Pre-computed answer files (.jsonl) for both datasets.  
+• Aggregate metrics table mirroring Table 1.  
+• README listing all deviations from paper plus hardware used.  
+
+With this roadmap every component needed for faithful and efficient reproduction is clearly defined and parameterised, ready for subsequent Python implementation.

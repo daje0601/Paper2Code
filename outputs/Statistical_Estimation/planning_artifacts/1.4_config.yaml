@@ -1,0 +1,37 @@
+## config.yaml
+# Only hyper-parameters explicitly reported in the paper are included.
+# The paper does NOT describe any model training or fine-tuning, so
+# learning-rate / epochs / batch-size are intentionally omitted.
+
+experiment:
+  datasets:
+    - hotpotqa_distractor
+    - triviaqa_rc
+  random_seed: 42  # paper does not state; choose common default for reproducibility
+
+chunking:
+  chunk_size: 300        # (§3.1, §4.3)
+  overlap: 30            # (§3.1, §4.3)
+
+bayesian_filter:
+  mu0: 0.5               # (§4.3 prior mean)
+  sigma0: 0.1            # (§4.3 prior std)
+  sigma_obs: 0.05        # (§4.3 observation noise variance)
+  beta: 1.0              # (§3.2 Eq. 7, margin coefficient)
+
+generator:
+  model_name: facebook/bart-large   # (§4.2)
+  num_beams: 4                      # (§4.3 “beam size of 2 or 4”; we adopt 4)
+  max_generation_length: 128        # (§4.3)
+  encoder_max_tokens: 1024          # (§4.3, upper limit used in some runs)
+
+retrieval:             # optional; defaults match “SEQA (Chunk-Only)”
+  enabled: false
+  top_k: 3                           # (§4.2 “commonly k = 3”)
+
+evaluation:
+  metrics:
+    - BLEU
+    - ROUGE_L
+    - BERTScore
+    - Perplexity

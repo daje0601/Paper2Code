@@ -1,0 +1,239 @@
+```python
+## retrieval.py
+"""
+retrieval.py
+
+Vector–similarity passage retrieval used by the optional **SEQA (With
+Index)** variant described in Section 4.2 of the paper.  A lightweight
+wrapper around *faiss* that re-uses the same sentence encoder employed
+for chunk novelty scoring.
+
+Interface (as specified in the project design)
+----------------------------------------------
+class Retrieval:
+    + __init__(cfg: Config, encoder: Encoder | None = None)
+    + index_corpus(corpus_path: str) -> None
+    + retrieve(query: str, k: int | None = None) -> List[str]
+
+Notes
+-----
+*  The corpus is expected to be a **JSONL** file where each line is a
+   JSON object with at minimum the key ``"text"``.  Example line:
+
+       {"id": "Wiki_12345", "text": "Passage contents …"}
+
+   Any additional keys are ignored.  If ``"id"`` is missing a numeric
+   index is assigned automatically.
+
+*  FAISS `IndexFlatIP` (exact cosine similarity due to L2-normalisation)
+   is used for simplicity and reproducibility.
+
+*  All embeddings are computed via the shared `Encoder` instance to
+   guarantee consistency across the entire pipeline.
+
+*  This module is **only** imported and instantiated when
+   `cfg.retrieval_enabled` is true; otherwise the rest of the code-base
+   remains unaffected.
+
+*  No persistence (save/load) is implemented so that the file remains
+   self-contained and free of additional assumptions not present in
+   `config.yaml`.  Building the index is fast enough for moderate corpus
+   sizes (≲ 100 k passages).
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+from typing import Dict, List, Sequence
+
+import numpy as np
+
+# faiss may be compiled with/without GPU support; import guard required.
+try:
+    import faiss  # type: ignore
+except ModuleNotFoundError as exc:  # pragma: no cover
+    raise ModuleNotFoundError(
+        "Package 'faiss' is required for retrieval but not installed.  "
+        "Install either 'faiss-cpu' or 'faiss-gpu' as per requirements."
+    ) from exc
+
+from config import Config
+from encoder import Encoder
+from utils import setup_logging
+
+__all__ = ["Retrieval"]
+
+
+class Retrieval:  # noqa: WPS110 (domain-specific name)
+    """Simple FAISS-based passage retriever."""
+
+    # ------------------------------------------------------------------ #
+    # Construction                                                       #
+    # ------------------------------------------------------------------ #
+    def __init__(self, cfg: Config, encoder: Encoder | None = None) -> None:
+        """
+        Parameters
+        ----------
+        cfg:
+            Global read-only configuration object (singleton).
+        encoder:
+            Optional *pre-initialised* sentence `Encoder`.  If ``None``,
+            the constructor will instantiate its own encoder.  Sharing an
+            encoder is recommended to save GPU memory.
+        """
+        self._cfg = cfg
+        self._logger = setup_logging(cfg, name=self.__class__.__name__)
+
+        # Either re-use provided encoder or create a new one.
+        self._encoder = encoder if encoder is not None else Encoder(cfg)
+        self._dim: int = self._encoder.dim
+
+        # FAISS index and id→text mapping initialised later.
+        self._index: faiss.Index | None = None
+        self._id_to_text: Dict[int, str] = {}
+
+        # Internal flag indicating readiness for search.
+        self._ready: bool = False
+
+        # Batch size for embedding passages (fall back to 64 if absent).
+        self._batch_size: int = int(getattr(cfg, "encoder_batch_size", 64)) or 64
+
+    # ------------------------------------------------------------------ #
+    # Index creation                                                     #
+    # ------------------------------------------------------------------ #
+    def index_corpus(self, corpus_path: str | pathlib.Path) -> None:  # noqa: C901
+        """Build an in-memory FAISS index over the given *corpus_path*.
+
+        The corpus **must** be a UTF-8 encoded JSONL file with at least
+        the field ``"text"`` on every line.
+
+        Parameters
+        ----------
+        corpus_path:
+            File-system path to the JSONL corpus.
+        """
+        path = pathlib.Path(corpus_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Corpus file not found: {path}")
+
+        self._logger.info("Reading corpus from %s …", path)
+        raw_passages: List[str] = []
+        with path.open("r", encoding="utf-8") as fp:
+            for line_number, line in enumerate(fp):
+                if not line.strip():
+                    continue  # skip blank lines
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self._logger.error(
+                        "Malformed JSON on line %d of %s: %s",
+                        line_number + 1,
+                        path,
+                        exc,
+                    )
+                    continue
+                text = obj.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    # Ignore entries with empty or invalid text.
+                    continue
+                raw_passages.append(text.strip())
+
+        if not raw_passages:
+            raise RuntimeError(f"No valid passages found in {path}.")
+
+        self._logger.info(
+            "Loaded %d passages.  Computing embeddings in batches of %d …",
+            len(raw_passages),
+            self._batch_size,
+        )
+
+        # Embed passages in mini-batches ---------------------------------- #
+        embeddings: List[np.ndarray] = []  # list to avoid pre-alloc OOM
+        for start in range(0, len(raw_passages), self._batch_size):
+            batch = raw_passages[start : start + self._batch_size]  # noqa: WPS362
+            vecs = self._encoder.embed(batch).cpu().numpy()  # (B, dim)
+            embeddings.append(vecs.astype(np.float32, copy=False))
+
+        # Concatenate into (N, dim) matrix.
+        mat = np.vstack(embeddings)
+        if mat.shape != (len(raw_passages), self._dim):
+            raise RuntimeError("Unexpected embedding matrix shape.")
+
+        # Build FAISS index (exact, inner product) ------------------------ #
+        self._logger.info("Building FAISS IndexFlatIP (dim=%d) …", self._dim)
+        index = faiss.IndexFlatIP(self._dim)
+        index.add(mat)  # type: ignore[arg-type]  (expects float32 np.ndarray)
+
+        self._index = index
+        # row-id → text mapping
+        self._id_to_text = {idx: txt for idx, txt in enumerate(raw_passages)}
+        self._ready = True
+
+        self._logger.info(
+            "Retrieval index ready.  Total vectors: %d", self._index.ntotal
+        )
+
+    # ------------------------------------------------------------------ #
+    # Search                                                             #
+    # ------------------------------------------------------------------ #
+    def retrieve(self, query: str, k: int | None = None) -> List[str]:
+        """Return the *k* most similar passages for *query*.
+
+        Parameters
+        ----------
+        query:
+            Natural-language query string.
+        k:
+            Number of passages to return.  If ``None`` the method uses
+            ``cfg.retrieval_top_k`` (default = 3).
+
+        Returns
+        -------
+        List[str]
+            Passage texts ordered by descending similarity.  If the index
+            contains fewer than *k* passages the list will be shorter.
+        """
+        if not self._ready or self._index is None:
+            raise RuntimeError(
+                "Retrieval index not initialised.  Call `index_corpus()` first."
+            )
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("`query` must be a non-empty string.")
+
+        top_k = int(k) if k is not None else int(getattr(self._cfg, "retrieval_top_k", 3))
+        if top_k <= 0:
+            raise ValueError("`k` must be positive or None.")
+
+        # Encode query (result is shape (1, dim) torch.Tensor)
+        q_vec = self._encoder.embed([query]).cpu().numpy().astype(np.float32)
+
+        # Search
+        distances, indices = self._index.search(q_vec, top_k)
+        idxs: Sequence[int] = indices[0]
+
+        # Map to passage texts, filtering out invalid indices (-1)
+        results: List[str] = [
+            self._id_to_text[i]
+            for i in idxs
+            if i != -1 and i in self._id_to_text
+        ]
+        self._logger.debug(
+            "Retrieved %d / %d passages for query '%s…'.",
+            len(results),
+            top_k,
+            query[:30],
+        )
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Dunder & helper methods                                            #
+    # ------------------------------------------------------------------ #
+    def __repr__(self) -> str:  # noqa: D401
+        status = "ready" if self._ready else "uninitialised"
+        return (
+            f"Retrieval(index_status={status}, dim={self._dim}, "
+            f"passages={self._index.ntotal if self._index else 0})"
+        )
+```

@@ -1,0 +1,181 @@
+utils.py  –  Logic Analysis and Intended Functionality
+======================================================
+
+Overview  
+--------
+This helper module centralises generic, non-model specific utilities that are required across virtually every other component in the SEQA reproduction code-base.  It contains only *stateless* functions so that importing it never has side-effects beyond (optional) logging configuration and deterministic seeding.  All behaviour must comply with the Design’s “Data structures and interfaces” section and must *not* introduce public interfaces that are absent from the diagram.
+
+The four public helpers foreseen by the Design are:
+
+1. seed_everything(seed:int│None)  
+2. flatten_dict(nested:dict, parent_key:str = "", sep:str = "/") → dict  
+3. length_limit(tokenizer, text:str, max_tokens:int) → str  
+4. setup_logging(cfg:Config, name:str│None = None) → logging.Logger  
+
+Only these should be imported by the rest of the code.  Internal/private helpers can be declared with a leading underscore, but must not be relied upon by other modules directly.
+
+--------------------------------------------------------------------
+1. seed_everything
+--------------------------------------------------------------------
+Purpose  
+• Ensure that results are reproducible across runs and machines.  
+• Covers Python’s `random`, NumPy, and PyTorch PRNGs, and also sets `PYTHONHASHSEED` so that dictionary iteration order stays deterministic.  
+• Must respect `experiment.random_seed` field from `config.yaml`.  
+• Called once, **very early** in `main.py` **before** any heavy-weight library (HF transformers, datasets) initialises GPU/cuda contexts, because some of those libs read global seeds at import time.
+
+Implementation logic  
+a. If `seed is None`, attempt to read from `Config.random_seed`; otherwise raise `ValueError` – the project never runs with an unspecified seed.  
+b. Convert to `int` and do boundary checking (0 ≤ seed ≤ 2³²-1).  
+c. Set:  
+
+    • `os.environ["PYTHONHASHSEED"]`  
+    • `random.seed(seed)`  
+    • `np.random.seed(seed)`  
+    • `torch.manual_seed(seed)`  
+    • `torch.cuda.manual_seed_all(seed)`  (guard on CUDA availability)
+
+d. Enable full determinism for CUDA kernels:  
+   `torch.backends.cudnn.deterministic = True`,  
+   `torch.backends.cudnn.benchmark     = False`  
+   (important because tokenisation + embedding are GPU heavy).  
+e. Return the seed so callers can log it.
+
+Edge cases  
+• If torch is compiled without CUDA, the cuda calls should be skipped.  
+• No heavy imports (e.g., transformers) must be triggered inside this function; they come later in the stack.
+
+--------------------------------------------------------------------
+2. flatten_dict
+--------------------------------------------------------------------
+Purpose  
+Nested dictionaries coming from metrics (`evaluation.py`) or hyper-parameters (`Config.as_dict()`) must be serialised for JSON or CSV logging.  `flatten_dict` converts:
+
+```
+{
+  "generator": { "num_beams": 4 },
+  "bayesian_filter": { "mu0": 0.5, "beta": 1.0 }
+}
+```
+into
+```
+{
+  "generator/num_beams": 4,
+  "bayesian_filter/mu0": 0.5,
+  "bayesian_filter/beta": 1.0
+}
+```
+
+Implementation logic  
+• Depth-first traversal (recursive) while concatenating keys with a separator (default `/`).  
+• Leaves values that are themselves dicts or list of dicts? – only flatten dicts; lists/tuples keep their position index, e.g., `"metrics/0": "BLEU"`.  
+• Non-serialisable objects (e.g., torch tensors) should be converted to `str()` so that logging or YAML dumping never crashes.
+
+Complexity: O(total_number_of_items) time and memory.
+
+--------------------------------------------------------------------
+3. length_limit
+--------------------------------------------------------------------
+Purpose  
+Given an assembled prompt string, ensure it does **not** exceed the encoder token budget specified in `config.generator.encoder_max_tokens` (512 or 1024).  This is critical because BART’s tokenizer will otherwise truncate or error out, breaking positional alignment and reproducibility.
+
+Signature  
+`length_limit(tokenizer, text, max_tokens) -> str`
+
+Arguments  
+• `tokenizer`  – a Hugging-Face tokenizer that provides a fast `__call__` returning `input_ids` length without constructing tensors (`with_padding=False, add_special_tokens=False`).  
+• `text`       – plain string (unicode).  
+• `max_tokens` – integer budget.
+
+Implementation logic  
+1. Tokenise `text`; if `len(ids) ≤ max_tokens`, return original `text`.  
+2. If overflow:  
+   a. Compute a *safe* truncation index.  Because prompt is sequence of accepted chunks (already separated by newline), simplest is to iteratively drop **whole chunks from the end** until the token count fits.  But `length_limit` should stay generic, so default behaviour is to cut at whitespace boundary:  
+      • While len(ids) > budget: remove last *N* characters, where *N* is proportional (~500 chars) to accelerate convergence, then re-tokenise.  
+      • Alternative strategy: binary search on character index.  
+   b. Guarantee returned text is non-empty; if inevitably empty, raise `RuntimeError` (should never happen given sensible chunk acceptance rates).  
+3. Return truncated string.
+
+Note: Actual chunk pruning logic (e.g., dropping lowest novelty chunks) lives in `PromptBuilder`.  `length_limit` merely enforces the hard cap.
+
+--------------------------------------------------------------------
+4. setup_logging
+--------------------------------------------------------------------
+Purpose  
+Uniform logging across all modules using the standard library’s `logging` module:
+
+• Root level defined once so that *all* subsequent `logging.getLogger(__name__)` calls propagate to the same handlers.  
+• Log file path configurable: `logs/seqa_{timestamp}.log` by default.  
+• Console handler with colour is **not** permitted because `colorlog` or `rich` are *not* in requirements.  Stick to simple formatter.  
+• Log level:  
+  – DEBUG if `Config.debug` exists and is `True`;  
+  – else INFO.
+
+Implementation logic  
+a. Only create handlers if not already configured (`logging.getLogger().handlers`).  
+b. Format string: `'%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'` (UTC time to avoid TZ drift).  
+c. File handler writes same format; make sure directory exists (`mkdir -p logs`).  
+d. Return a module-level logger for convenience.
+
+Usage pattern  
+`logger = utils.setup_logging(cfg, __name__)` inside every module.
+
+--------------------------------------------------------------------
+Internal / Private helpers
+--------------------------------------------------------------------
+• `_ensure_dir(path:str)` – mkdir on demand; used by setup_logging.  
+• `_is_jsonable(obj)` – validate values before flattening (optional).
+
+--------------------------------------------------------------------
+Interaction with Config Singleton
+--------------------------------------------------------------------
+`Config` is loaded inside `main.py` and imported in downstream modules; however, utilities should *not* import Config at module import time (circular dependency!).  Instead, functions take explicit arguments (`cfg:Config` or scalar params).  `setup_logging` expects a *fully initialised* Config, so `main.py` must call it **after** Config.load().
+
+--------------------------------------------------------------------
+Edge-case Guarantees
+--------------------------------------------------------------------
+• All utilities must run on *both* Python 3.9 and 3.12 (per requirements).  
+• No heavy dependencies; only `os`, `sys`, `random`, `logging`, `pathlib`, `typing`, `time`, `datetime`, plus optional `torch` and `numpy` for seeding.  
+• Functions avoid mutable default arguments; no global state except the logger and PRNGs modified by seed_everything.  
+• Thread safety: logging already serialises writes; other utils are stateless.  
+• `length_limit` must not allocate GPU memory.
+
+--------------------------------------------------------------------
+Unit Testing Checklist
+--------------------------------------------------------------------
+1. seed_everything  
+   • Call with seed=123, then generate torch/np/random numbers; repeat → identical sequences.  
+   • Validate `os.environ["PYTHONHASHSEED"]` == "123".
+
+2. flatten_dict  
+   • Deep nested dict (depth 3) flattened keys count matches original leaves count.  
+   • Separator change works.
+
+3. length_limit  
+   • Prompt that is under, equal to, and over the budget produce expected results.  
+   • Returned string length (in tokens) ≤ `max_tokens`.  
+   • Stress test with 10 000-token string to ensure O(N log N) or better behaviour.
+
+4. setup_logging  
+   • Subsequent calls do not duplicate handlers.  
+   • Log file is created and receives entries.
+
+--------------------------------------------------------------------
+Resulting Public API in utils.py
+--------------------------------------------------------------------
+```
+seed_everything(seed: int) -> int
+flatten_dict(d: dict, parent_key: str = '', sep: str = '/') -> dict
+length_limit(tokenizer: PreTrainedTokenizerBase, text: str, max_tokens: int) -> str
+setup_logging(cfg: Config, name: str | None = None) -> logging.Logger
+```
+
+No other top-level public symbols are to be exported; any additional helper must be prefixed with an underscore.
+
+--------------------------------------------------------------------
+Alignment with Paper & Config
+--------------------------------------------------------------------
+• The seed value comes directly from `config.yaml` (`experiment.random_seed`).  
+• Token budget (`max_tokens`) must honour `config.generator.encoder_max_tokens`; do *not* hard-code 512/1024.  
+• Logging of seed and other hyper-parameters will utilise `flatten_dict` so experiments can be traced, a key requirement for scientific reproducibility emphasised by the paper.  
+
+This logic analysis ensures that when we later implement `utils.py`, every other module (chunker, bayesian_filter, ... ) gets deterministic behaviour, robust logging, and convenient helper functionality—without deviating from either the Design diagram or the configuration file.

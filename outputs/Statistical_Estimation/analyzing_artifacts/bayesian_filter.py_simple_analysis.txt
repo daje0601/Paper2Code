@@ -1,0 +1,211 @@
+```python
+# bayesian_filter.py
+#
+# LOGIC-ANALYSIS ONLY – NO EXECUTABLE CODE YET
+# --------------------------------------------------------
+# This file will implement the “BayesianFilter” class
+# exactly as declared in “Data structures and interfaces”.
+# The class is the heart of the Statistical-Estimation QA
+# pipeline: it receives a *sequence of text chunks* plus
+# their *pre-computed sentence embeddings* and decides,
+# online, which chunks are “novel enough” to keep.  Novelty
+# is measured w.r.t. a *running context vector* and a
+# *Bayesian posterior* over novelty scores, as described in
+# §3.2 of the paper.  The accepted subset is passed to the
+# PromptBuilder.
+#
+# Public API (MUST MATCH DESIGN ‑- do not add / rename):
+#
+#   class BayesianFilter:
+#       __init__(cfg:Config)
+#       reset()                                       -> None
+#       filter(chunks:List[str],
+#              embeds:torch.Tensor)                  -> List[str]
+#       _update_posterior(x:float)                    -> None
+#       _accept(x:float)                              -> bool
+#
+# No additional public methods are allowed.
+#
+# ---------------------------------------------------------------------
+# 1.  INTERNAL STATE & PARAMETER SOURCES
+# ---------------------------------------------------------------------
+# • μ  (mu)             : current posterior mean of novelty
+# • σ  (sigma)          : current posterior std-dev
+# • σ_obs² (sigma_obs)  : fixed observation noise (read from cfg)
+# • β  (beta)           : decision margin (cfg.bayesian_filter.beta)
+# • v_sel               : running context vector (torch.Tensor or None)
+# • n_sel               : how many chunks have been accepted so far
+#
+# All hyper-parameters come *directly* from Config, which itself
+# reads config.yaml.  We MUST NOT invent default values that
+# conflict with the YAML:
+#
+#   mu0      = cfg.bayesian_filter.mu0
+#   sigma0   = cfg.bayesian_filter.sigma0
+#   sigma_obs= cfg.bayesian_filter.sigma_obs
+#   beta     = cfg.bayesian_filter.beta
+#
+# Device handling:
+#   – embeddings arrive as torch.Tensor on caller’s device (GPU/CPU)
+#   – v_sel must reside on the same device for correct ops
+#
+# ---------------------------------------------------------------------
+# 2.  NOVELTY SCORE  (Eq. 4 in paper)
+# ---------------------------------------------------------------------
+# The paper’s formula has a typo; for reproducibility we adopt the
+# *cosine-distance* interpretation used in the reproduction plan:
+#
+#   cos_sim = (h_k ⋅ v_sel) / (‖h_k‖ · ‖v_sel‖ + ε)
+#   X_k     = 1.0 – cos_sim                # 0 ≈ identical, 2 ≈ opposite
+#
+# ε = 1e-8 (fixed constant in code).
+#
+# Special cases:
+#   • If v_sel is None (no previous chunk accepted), we *force*
+#     accept the very first chunk and set X_1 = 1.0              (design choice ─ any positive value > τ₀).
+#
+# Efficiency note:
+#   Embeddings are *already* L2-normalised inside Encoder, so we
+#   may compute cosine as simple dot-product.  Nevertheless, we’ll
+#   guard against norm drift by re-normalising v_sel after each
+#   update (torch.nn.functional.normalize).
+#
+# ---------------------------------------------------------------------
+# 3.  POSTERIOR UPDATE  (Eq. 5 & 6 in paper)
+# ---------------------------------------------------------------------
+# The conjugate update for a Normal prior with known variance:
+#
+#   sigma²_post = 1 / (1/σ_prior² + 1/σ_obs²)
+#   mu_post     = sigma²_post * ( μ_prior/σ_prior² + X_k/σ_obs² )
+#
+# Implementation tricks:
+#   • Keep σ rather than σ² to avoid repeated sqrt.
+#   • Use float32 or float64 CPU scalars; overhead negligible.
+#   • Update posterior *for every observed X_k* (accepted OR
+#     rejected).  This matches the “online” wording in §3.2 and keeps
+#     the threshold adaptive to the *stream*, not only to the kept
+#     subset.  If we later need an ablation (“update_on_accepted =
+#     False”), we can add a private boolean but MUST NOT expose it
+#     publicly.
+#
+# ---------------------------------------------------------------------
+# 4.  DECISION THRESHOLD
+# ---------------------------------------------------------------------
+#   τ_k = μ + β * σ         # Eq. 7
+#
+# Accept when  X_k ≥ τ_k.
+#
+# β = 1.0 from config.yaml.
+#
+# Edge case guarantees:
+#   • σ can shrink toward zero if σ_obs << σ_prior and many identical
+#     scores appear; but βσ then shrinks too ⇒ τ_k still sensible.
+#
+# ---------------------------------------------------------------------
+# 5.  RUNNING CONTEXT VECTOR UPDATE  (Eq. 8 in paper, ambiguous)
+# ---------------------------------------------------------------------
+# The equation in the PDF seems inverted; we adopt the reproduc-
+# tion plan’s *running mean* (simpler, avoids overflow):
+#
+#   v_sel ← (n_sel * v_sel + h_k) / (n_sel + 1)
+#   n_sel ← n_sel + 1
+#
+# After update, v_sel is *immediately re-normalised*.
+#
+# Rationale: weighting by X_k/(X_k+1) (the paper’s w_k) bias-favours
+# highly novel chunks, but causes smaller updates when X_k≈0 (which
+# shouldn’t be accepted anyway).  Running mean is neutral and easy
+# to audit.  A TODO comment will reference this design decision.
+#
+# ---------------------------------------------------------------------
+# 6.  MAIN DRIVER: filter(...)
+# ---------------------------------------------------------------------
+# Arguments:
+#   chunks  : List[str]               length = K
+#   embeds  : torch.Tensor[ K, d ]    pre-normalised
+#
+# Returns:
+#   accepted_chunks : List[str]       preserved order of appearance
+#
+# Algorithmic steps:
+#
+#   reset()                   # clears posterior & v_sel
+#   for k in range(K):
+#       h_k = embeds[k]
+#       if v_sel is None:     # first chunk
+#           accept chunk k
+#           set v_sel = h_k.clone()
+#           X_k = 1.0         # or any value > τ₀
+#           _update_posterior(X_k)
+#           continue
+#
+#       compute X_k           # novelty
+#       _update_posterior(X_k)
+#       if _accept(X_k):
+#           update v_sel
+#           record chunk text
+#
+#   If *no* chunk was accepted (pathological – e.g. empty doc),
+#   fall back to keeping the *first chunk* to avoid empty prompt.
+#
+# Complexity:
+#   O(K·d) for dot products (one per chunk) – linear, cheap.
+#
+# Memory:
+#   Only embeddings for current document (~K up to length/300) are
+#   needed; they are already in Encoder-side batch.  Running vector
+#   adds O(d).
+#
+# ---------------------------------------------------------------------
+# 7.  RESET SEMANTICS
+# ---------------------------------------------------------------------
+# reset() must restore the object to its *prior* state so that the
+# same BayesFilter instance can be reused across documents without
+# re-allocation:
+#
+#   mu   ← mu0
+#   sigma← sigma0
+#   v_sel← None
+#   n_sel← 0
+#
+# ---------------------------------------------------------------------
+# 8.  UNIT-TEST IDEAS (for later)
+# ---------------------------------------------------------------------
+# • Verify that for identical embeddings (h_k == v_sel) X_k == 0 and
+#   chunk is rejected once τ_k > 0 (after ≥1 update).
+# • Feed a sequence with linearly increasing orthogonality; ensure
+#   acceptance rate drops at some point due to τ_k rising.
+# • Check reproducibility with fixed seed: accepted_indices stable.
+#
+# ---------------------------------------------------------------------
+# 9.  CONFIG SANITY-CHECK INSIDE __init__
+# ---------------------------------------------------------------------
+# Guard conditions:
+#   assert 0 < cfg.bayesian_filter.sigma_obs
+#   assert cfg.bayesian_filter.sigma0 > 0
+#   assert cfg.bayesian_filter.beta >= 0
+#
+# Provide helpful ValueError if violated.
+#
+# ---------------------------------------------------------------------
+# 10.  RETURN TYPE & ORDER CONTRACT
+# ---------------------------------------------------------------------
+# • Returned list keeps original chronology; this is important for
+#   coherence when the PromptBuilder concatenates them.
+# • We do NOT return embeddings – that would expose hidden state.
+#
+# ---------------------------------------------------------------------
+# 11.  OPEN QUESTIONS / TODO TAGS
+# ---------------------------------------------------------------------
+# # TODO(ambiguous): revisit weighting scheme once reproduction
+#      experiments confirm whether simple mean or paper’s w_k mirrors
+#      Table 1 BERTScore numbers more closely.
+#
+# # TODO(analysis): investigate impact of updating posterior on
+#      accepted chunks only; keep private flag _update_on_all for
+#      quick ablation (NOT part of public API).
+#
+# ---------------------------------------------------------------------
+# End of logic analysis for bayesian_filter.py
+# ---------------------------------------------------------------------
+```

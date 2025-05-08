@@ -1,0 +1,258 @@
+evaluation.py  ‑  Logic Analysis
+================================
+
+Objective  
+---------  
+Implement `Evaluator` that reproducibly computes the four *generative* QA metrics mandated by the paper (§4.4) and specified in `config.yaml`:
+
+1. BLEU  (SacreBLEU v2.4.2)  
+2. ROUGE-L  (rouge-score 0.1.2)  
+3. BERTScore F1  (bert-score 0.3.13; model **roberta-large**)  
+4. Perplexity  (negative-log-likelihood based on **EleutherAI/gpt-neo-125M**)
+
+The class **MUST** follow the interface declared in the design:
+
+```
+class Evaluator:
+    +__init__(cfg:Config)
+    +score(preds:List[str], refs:List[str]) -> dict
+```
+
+No other public methods or attributes may be exposed.
+
+
+High-Level Algorithm  
+--------------------
+
+```
+__init__
+│ 1. persist Config reference
+│ 2. parse cfg.evaluation.metrics list into a boolean flags dict
+│ 3. lazily load heavy artefacts (GPT-Neo, BERTScore IDF stats) ONLY for
+│    metrics that are actually requested; keep handles on self.*
+└─4. set device = 'cuda' if torch.cuda.is_available() else 'cpu'
+```
+
+```
+score(preds, refs)
+│ 1. sanity check: len(preds) == len(refs); raise ValueError otherwise
+│ 2. for each metric flag invoke the corresponding _compute_* helper
+│ 3. collect scalar results in an OrderedDict that respects the
+│    order declared in cfg.evaluation.metrics
+└─4. return the dict, e.g.
+      {"BLEU": 5.17, "ROUGE_L": 0.0421, "BERTScore": 0.7894, "Perplexity": 278.6}
+```
+
+Metric-Specific Logic  
+---------------------
+
+### 1. BLEU ( _sacrebleu_ )
+
+• Use `sacrebleu.corpus_bleu(preds, [refs], tokenize='13a', lowercase=False)`.  
+• Output the *score* attribute (already percentage).  
+• SacreBLEU handles tokenisation internally; **no ad-hoc preprocessing** permitted—this exactly mirrors paper’s evaluation consistency.  
+• The function is deterministic; no seed required.
+
+Helper:
+
+```python
+def _compute_bleu(self, preds, refs):
+    import sacrebleu
+    bleu = sacrebleu.corpus_bleu(preds, [refs], tokenize="13a", lowercase=False)
+    return bleu.score          # float
+```
+
+### 2. ROUGE-L ( _rouge_score_ )
+
+• `rouge-score` returns precision/recall/f1; keep F1.  
+• Need to loop over pairs → accumulate F1, then mean.  
+• Tokeniser: same default Porter stemmer used in library; do **not** lower-case unless library does.  
+• Implementation:
+
+```python
+def _compute_rouge(self, preds, refs):
+    from rouge_score import rouge_scorer
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    scores = [scorer.score(r, p)['rougeL'].fmeasure  # NB order
+              for p, r in zip(preds, refs)]
+    return float(np.mean(scores))
+```
+
+### 3. BERTScore ( _bert_score_ )
+
+• Call `bert_score.score` with:  
+  – `model_type='roberta-large'` (paper default)  
+  – `lang='en'`  
+  – `rescale_with_baseline=True` for stability (common practice).  
+• Returns P/R/F1 tensors; index [2] for F1; take `.mean().item()`.  
+• GPU use if available.  
+• Load occurs once during first call; heavy.
+
+```python
+def _compute_bertscore(self, preds, refs):
+    from bert_score import score as bs_score
+    P, R, F1 = bs_score(preds, refs,
+                        model_type="roberta-large",
+                        lang="en",
+                        rescale_with_baseline=True,
+                        verbose=False,
+                        device=self.device)
+    return float(F1.mean().item())
+```
+
+### 4. Perplexity (GPT-Neo 125M)
+
+Definition (paper §4.4): feed generated answer into GPT-Neo-125M and compute exponentiated average negative log-likelihood per token.
+
+Implementation steps:
+
+```
+1. Load tokenizer & model ('EleutherAI/gpt-neo-125M'), padding_side='left'
+2. Model.eval(); no_grad(); half precision if cuda & cfg.fp16_perplexity flag (optionally)
+3. Batch answers to avoid OOM (batch_size configurable; default 8)
+4. For each batch:
+     a. token_ids = tokenizer(batch, return_tensors="pt", padding=True)
+     b. shift tokens: labels = token_ids.clone(); labels[padded_tokens] = -100
+     c. loss = model(input_ids, attention_mask, labels=labels).loss       # averaged per token
+     d. ppl = torch.exp(loss)
+5. Final PPL = mean(list_of_ppl).cpu().item()
+```
+
+Note: We compute perplexity **only on predictions** (not reference) as done in paper (they speak of *“gauge fluency of outputs”*).  
+
+Edge Cases:  
+• Empty predictions ⇒ treat as “<eos>” token to avoid NaN.  
+• Long answers that exceed model context (2048 tokens) are truncated automatically by tokenizer.
+
+Helper:
+
+```python
+def _compute_perplexity(self, preds):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if not hasattr(self, "_ppl_model"):
+        tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
+        mdl = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M")
+        mdl.to(self.device); mdl.eval()
+        self._ppl_tokenizer, self._ppl_model = tok, mdl
+
+    batch_size = 8
+    ppl_scores = []
+    for i in range(0, len(preds), batch_size):
+        batch = preds[i:i+batch_size]
+        enc = self._ppl_tokenizer(batch, return_tensors="pt",
+                                  padding=True, truncation=True).to(self.device)
+        labels = enc["input_ids"].clone()
+        labels[enc["attention_mask"] == 0] = -100
+        with torch.no_grad():
+            loss = self._ppl_model(**enc, labels=labels).loss
+        ppl_scores.append(torch.exp(loss).cpu())
+    return float(torch.mean(torch.stack(ppl_scores)).item())
+```
+
+Computational Notes  
+-------------------
+
+• BLEU & ROUGE negligible.  
+• BERTScore is GPU-heavy (roberta-large); approx 2–3 GB VRAM for 1k pairs.  
+• Perplexity: GPT-Neo-125M consumes ~2.5 GB VRAM in fp32; we can adopt fp16 casting if CUDA + A100/RTX but keep as fp32 by default to avoid overflow.  
+
+Resource fallback:
+If `self.device == 'cpu'`, both BERTScore and Perplexity still work but are slow; emit a `warnings.warn` message.
+
+Randomness / Reproducibility  
+-----------------------------
+
+• Provide `utils.seed_everything(cfg.random_seed)` call inside __init__ to ensure deterministic behaviour of torch/numpy.  
+• SacreBLEU & ROUGE deterministic by design.  
+• BERTScore has internal torch operations; seed guarantees repeatability.
+
+Edge-Condition Handling  
+-----------------------
+
+• Non-ASCII characters handled transparently by underlying libs (all Unicode aware).  
+• Mismatched prediction/ref lengths already caught by sanity check.  
+• Empty dataset ⇒ raise ValueError (caller side).
+
+Time Complexity  
+---------------
+
+Let N = #examples.
+
+| Metric      | Complexity | Bottleneck                           |
+|-------------|------------|--------------------------------------|
+| BLEU        | O(N)       | negligible                           |
+| ROUGE-L     | O(N·L)     | where L=avg tokens per answer        |
+| BERTScore   | O(N·L)     | heavy ‑ passes through Roberta-large |
+| Perplexity  | O(N·L)     | heavy ‑ passes through GPT-Neo       |
+
+We therefore batch BERTScore & PPL to fully utilise GPU.
+
+Internal Attributes Summary  
+---------------------------
+
+```
+self.cfg                # Config singleton
+self.device             # 'cuda' or 'cpu'
+self._bert_score_model  # cached tuple P,R,F1 (actually handled inside bert-score)
+self._ppl_model         # GPT-Neo model (lazy)
+self._ppl_tokenizer     # GPT-Neo tokenizer (lazy)
+self.metrics_flags      # {'BLEU':True, 'ROUGE_L':True, ...}
+```
+
+Pseudocode Skeleton  
+-------------------
+
+```python
+class Evaluator:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        utils.seed_everything(cfg.experiment.random_seed)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # flags
+        wanted = {m.upper(): True for m in cfg.evaluation.metrics}
+        self.metrics_flags = {k: wanted.get(k, False) for k in
+                              ("BLEU", "ROUGE_L", "BERTSCORE", "PERPLEXITY")}
+
+        # Lazy placeholders
+        self._ppl_model = self._ppl_tokenizer = None
+        # no preload for bert-score; library handles caching
+
+    def score(self, preds: List[str], refs: List[str]) -> dict:
+        if len(preds) != len(refs):
+            raise ValueError("pred/ref length mismatch")
+
+        results = collections.OrderedDict()
+        if self.metrics_flags["BLEU"]:
+            results["BLEU"] = self._compute_bleu(preds, refs)
+        if self.metrics_flags["ROUGE_L"]:
+            results["ROUGE_L"] = self._compute_rouge(preds, refs)
+        if self.metrics_flags["BERTSCORE"]:
+            results["BERTScore"] = self._compute_bertscore(preds, refs)
+        if self.metrics_flags["PERPLEXITY"]:
+            results["Perplexity"] = self._compute_perplexity(preds)
+
+        return results
+```
+
+Unit-Testing Strategy  
+---------------------
+
+1. Hard-code two trivial examples:  
+   – pred = “hello world”, ref = “hello world”   ➔ BLEU ≈ 100, ROUGE-L ≈ 1, BERTScore > 0.99, PPL reasonable.  
+2. Input arrays length mismatch should raise exception.  
+3. Toggle individual metrics in `config.yaml` and assert skipped ones are absent in output dict.
+
+All these tests live in `tests/test_evaluator.py` (not part of current task list but assists future maintenance).
+
+Compliance Check  
+----------------
+
+✓  100 % aligned with **Data structures and interfaces**: we only provide `__init__` and `score`.  
+✓  All hyper-parameters (model names, batch sizes, seed) obtained from `config.yaml` or sensible defaults *without* introducing hidden knobs.  
+✓  Uses only packages enumerated in “Required packages”.  
+✓  No deviation from paper’s metric definitions.  
+✓  Reproducibility ensured via fixed seed & deterministic tokenisation pipelines.
+
+This completes the logic analysis needed to code `evaluation.py`.

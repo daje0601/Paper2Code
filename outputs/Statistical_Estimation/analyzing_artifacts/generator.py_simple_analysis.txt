@@ -1,0 +1,133 @@
+File: generator.py  
+Purpose: Encapsulate all logic related to loading the Hugging-Face seq-to-seq model (facebook/bart-large in the paper) and producing an answer string from a fully-formed prompt.  The object must (a) respect every hyper-parameter that appears in config.yaml, (b) remain completely stateless with regard to the Bayesian filtering / chunk selection, and (c) expose a single public method ­– answer(prompt:str) → str – exactly as declared in “Data structures and interfaces”.
+
+--------------------------------------------------------------------
+1. Imports & Global Dependencies
+--------------------------------------------------------------------
+Required third-party packages (all already listed under “Required packages”):
+
+• torch                           – tensor creation, device placement  
+• transformers                    – PreTrainedTokenizerFast, AutoModelForSeq2SeqLM  
+• typing                          – type hints (Optional, List)  
+• Config                          – the singleton defined in config.py  
+• utils.seed_everything           – ensure determinism for generation  
+• warnings                        – graceful fall-back messages when GPU not available  
+
+No additional libraries are needed for generator.py; do NOT import anything that is not listed in the design.
+
+--------------------------------------------------------------------
+2. Object Life-Cycle & Responsibilities
+--------------------------------------------------------------------
+class Generator
+  • __init__(cfg: Config)
+        – load tokenizer and seq2seq model given cfg.generator.model_name  
+        – place model on correct device (CUDA if available | default ‘cpu’)  
+        – switch model to evaluation mode; optionally enable fp16 via .half() when CUDA & cfg.fp16 flag (future extension)  
+        – store generation hyper-parameters locally (num_beams, max_generation_length, encoder_max_tokens) so answer() doesn’t need to re-query Config each call  
+        – call utils.seed_everything(cfg.random_seed) for deterministic beam search  
+  • answer(prompt: str) -> str
+        – Tokenise prompt with truncation=True, max_length=cfg.generator.encoder_max_tokens. *Important*: The prompt builder already tries to stay within this limit, but generator must enforce to guarantee no encoder overflow which would crash generation.  
+        – Run model.generate() with:
+              input_ids, attention_mask  
+              max_length           = cfg.generator.max_generation_length  
+              num_beams            = cfg.generator.num_beams  
+              early_stopping       = True                       (paper §4.3)  
+              length_penalty       = 1.0                        (paper default implied)  
+              repetition_penalty   = 1.0                        (not specified but safe default)  
+              no_repeat_ngram_size = 3                          (NOT in paper; therefore DO NOT include!)  
+          Only use parameters explicitly present in paper/config to comply with rule 1 (“Align with the Paper”) & rule 5 (“Refer to configuration”).  
+        – Decode with tokenizer.decode(ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)  
+        – Strip leading/trailing whitespace and return.  
+  • answer_batch(prompts: List[str]) -> List[str]   (OPTIONAL)
+        - Batch generation to improve throughput.  If implemented, must still respect encoder_max_tokens per item.  Not mandatory for reproduction but can be helpful; expose only if needed elsewhere.
+
+--------------------------------------------------------------------
+3. Device & Memory Considerations
+--------------------------------------------------------------------
+facebook/bart-large (406M parameters) fits comfortably on 1 × 24GB GPU; if only CPU available, generation is still feasible albeit slower.  generator.py must:
+
+• Detect device automatically:  
+      self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  
+
+• Warn user if CUDA absent:  
+      warnings.warn("CUDA not available, running BART-Large on CPU – this will be slow.")  
+
+• Use with torch.inference_mode(): around model.generate to reduce memory usage.
+
+• Avoid gradient calculations – never call model.train().
+
+• Respect Config.encoder_max_tokens. If prompt is longer, raise ValueError or at least log a warning and truncate (safer).  NEVER allow tokens to exceed the limit because BART’s encoder is position-emb-capped at 1024 by default.
+
+--------------------------------------------------------------------
+4. Determinism & Seeds
+--------------------------------------------------------------------
+The paper never specifies random seeds, but config.yaml sets experiment.random_seed = 42.  generator.py must call utils.seed_everything(seed) in __init__, then pass deterministic=True to torch.backends.cudnn if available.  transformers’ generate() uses torch’s RNG for sampling even in beam search (for tie-breakers), so this ensures reproducibility.
+
+--------------------------------------------------------------------
+5. Error Handling
+--------------------------------------------------------------------
+• If user passes an empty prompt → raise ValueError("Prompt cannot be empty")  
+• If model isn’t downloaded yet → transformers will auto-download; catch OSError to provide human-readable message.  
+• If tokenizer.pad_token_id is None (rare for some HF checkpoints) → set tokenizer.pad_token_id = tokenizer.eos_token_id to avoid assertion errors in generate().
+
+--------------------------------------------------------------------
+6. Interaction with Other Modules
+--------------------------------------------------------------------
+• prompt_builder.py will call Generator.answer() synchronously.  There are no circular dependencies since Generator only uses Config.  
+• evaluation.py, bayesian_filter.py, etc., never touch Generator directly; they just receive finished strings.  
+
+Thus generator.py *must not* import any of those modules to keep coupling minimal and match the design.
+
+--------------------------------------------------------------------
+7. Testing & Validation Checklist
+--------------------------------------------------------------------
+Unit-test generator via:
+
+(1) Fake short prompt (“Who are you?”) – ensure answer() returns non-empty string.  
+(2) Pass prompt length exactly equal to encoder_max_tokens – generation should succeed.  
+(3) Pass prompt length encoder_max_tokens + 10 – verify truncation / warning logic.  
+(4) Run twice with same seed – outputs identical (deterministic beam search).  
+(5) Compare runtime on GPU vs CPU for the same prompt for sanity.
+
+--------------------------------------------------------------------
+8. Open / Ambiguous Points & Chosen Resolution
+--------------------------------------------------------------------
+• Beam size: Paper says “beam size of 2 or 4”; config.yaml sets 4 → use cfg value.  
+• length_penalty / repetition_penalty not explicitly stated; default to 1.0 (transformers default) and document in code comment that these default values align with unspecified paper settings.  
+• FP16 use is *not* mandated; omitted to keep generator simple.  Document pathway for future extension.
+
+--------------------------------------------------------------------
+9. Pseudocode Outline
+--------------------------------------------------------------------
+```
+class Generator:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.generator.model_name)
+        self.model     = AutoModelForSeq2SeqLM.from_pretrained(cfg.generator.model_name)
+        self.model.to(self.device).eval()
+        utils.seed_everything(cfg.experiment.random_seed)
+
+        self.num_beams         = cfg.generator.num_beams
+        self.max_gen_len       = cfg.generator.max_generation_length
+        self.max_enc_tokens    = cfg.generator.encoder_max_tokens
+
+    @torch.inference_mode()
+    def answer(self, prompt:str)->str:
+        if not prompt:
+            raise ValueError("prompt empty")
+        enc = self.tokenizer(prompt, truncation=True,
+                             max_length=self.max_enc_tokens,
+                             return_tensors="pt").to(self.device)
+        gen_ids = self.model.generate(
+                       **enc,
+                       max_length=self.max_gen_len,
+                       num_beams=self.num_beams,
+                       early_stopping=True)
+        return self.tokenizer.decode(gen_ids[0],
+                                     skip_special_tokens=True,
+                                     clean_up_tokenization_spaces=True).strip()
+```
+
+This satisfies every interface guarantee listed in the design, obeys config.yaml strictly, and introduces no new hyper-parameters beyond those authorised.

@@ -1,0 +1,162 @@
+# retrieval.py  –  Logic Analysis
+#
+# Role within overall design
+# --------------------------
+# This module is *optional* and only activated when `Config.retrieval.enabled`
+# is True.  In the “SEQA (With Index)” variant described in the paper (§4.2),
+# a light‐weight vector search retrieves **top-k passages** *before* the
+# chunk-and-Bayesian-filter pipeline runs.  The Retrieval class therefore has
+# three responsibilities:
+#
+#   1.  Build (or load) a FAISS index over a corpus of passages that are
+#       potential sources of information for QA.
+#   2.  Keep a mapping from FAISS row-ids  →  raw passage text  (and, if
+#       desired, meta-data such as title or document id).
+#   3.  Provide a `retrieve(query, k) -> List[str]` method that returns the
+#       **raw texts** of the k most similar passages, using the *same* sentence
+#       encoder that the rest of the pipeline employs for chunk novelty
+#       scoring.  The caller can then concatenate those passages (or process
+#       them individually) and feed them into `Chunker` + `BayesianFilter`.
+#
+# Alignment with “Data structures and interfaces”
+# -----------------------------------------------
+# According to the design, Retrieval must expose:
+#
+#     class Retrieval:
+#         +__init__(cfg:Config)
+#         +index_corpus(corpus_path:str) -> None
+#         +retrieve(query:str, k:int) -> List[str]
+#
+# •  `__init__` receives the global `Config` instance and optionally an already
+#    initialised `Encoder` so that we do **not** load the sentence-transformer
+#    twice.  If an Encoder object is *not* handed in, Retrieval will create its
+#    own instance configured identically to `encoder.py`; this keeps the public
+#    signature simple while avoiding duplicated GPU memory usage when the
+#    pipeline supplies one.
+#
+# •  `index_corpus` reads a text file (or directory, or Hugging-Face dataset)
+#    specified by `corpus_path`.  For every atomic *passage* (granularity is a
+#    design choice, see below) it:
+#
+#       –  Calls `Encoder.embed()` to obtain an L2-normalised embedding.
+#       –  Appends that vector to a growing NumPy array.
+#       –  Stores the original text (and optional meta-data) in
+#          `self._id_to_text[row_id]`.
+#
+#    After all passages are processed the method initialises a FAISS
+#    `IndexFlatIP` (inner product ⇒ cosine similarity because vectors are
+#    normalised) and adds the array of passage vectors.  If
+#    `Config.retrieval.save_path` is present, the FAISS index and the
+#    id-to-text mapping are serialised to disk so that subsequent runs can
+#    simply `faiss.read_index()` instead of rebuilding.
+#
+# •  `retrieve` guarantees that the index is loaded/built (`self._ready == True`)
+#    and then encodes the **query string** with the same Encoder.  It calls
+#
+#          D, I = self._index.search(q_vec[np.newaxis, …], k)
+#
+#    and returns `[self._id_to_text[i] for i in I[0] if i != -1]`.
+#
+# Design Decisions & Paper Fidelity
+# ---------------------------------
+# 1. **Encoder re-use**  
+#      The sentence encoder must be *identical* to the one used for chunk
+#      embeddings so that cosine distances are comparable.  We therefore accept
+#      an `Encoder` instance in `__init__`.  The Retrieval class never performs
+#      an additional `.fit()` step—this aligns with the paper’s statement that
+#      no fine-tuning is performed.
+#
+# 2. **Passage granularity**  
+#      The paper’s description (“retrieve a small set of top-ranked passages”)
+#      is vague.  For HotpotQA & TriviaQA reproduction we will:
+#
+#        • Split Wikipedia dump pages (or the dataset-provided paragraphs) by
+#          *paragraph boundaries*; each paragraph becomes one passage.
+#        • Keep passage length ≤ Config.chunking.chunk_size (300 tokens) so
+#          they already fit BART’s encoder in worst case.
+#
+#      This ensures the vector index is not polluted by excessively long text
+#      and keeps retrieval latency low.
+#
+# 3. **FAISS index type**  
+#      • `IndexFlatIP` is chosen because it is exact and supports GPU
+#        acceleration (`faiss.index_cpu_to_gpu`) without additional code.  
+#      • For large corpora one could switch to `IndexIVFFlat`, but exact search
+#        is safer for reproducibility.  This setting is recorded in
+#        `config.yaml` only if changed manually—otherwise defaults apply.
+#
+# 4. **Cosine vs. Inner-product Normalisation**  
+#      All vectors are L2 normalised at creation time (`Encoder.embed()` already
+#      does this), so inner product equals cosine similarity.  This conforms to
+#      the novelty-score definition (§3.2) and ensures metric consistency.
+#
+# 5. **Top-k default**  
+#      Retrieval falls back to `cfg.retrieval.top_k` (default = 3) when the
+#      caller passes `k=None`.  This mirrors the paper’s “commonly k = 3”.
+#
+# 6. **Batching & Memory**  
+#      The `index_corpus()` implementation embeds passages in mini-batches
+#      (`cfg.embedding.batch_size` if such a field exists, else 64) and streams
+#      them through the encoder to avoid OOM errors when building large
+#      indices.  Embeddings are initially collected in a Python list, then
+#      stacked into a single `np.float32` array for FAISS consumption.
+#
+# 7. **Persistence and Cache Validity**  
+#      Because building an index over full Wikipedia can exceed 30 minutes, the
+#      module checks for a `.faiss` file and a `.jsonl` (id→text) sidecar; if
+#      both exist and `cfg.retrieval.force_rebuild` is False, it loads them.
+#      The logic hashes `cfg.encoder.model_name` and the corpus file path to
+#      detect mismatches and avoid silent reuse of an incompatible index.
+#
+# 8. **Thread-safety / Multi-processing**  
+#      The Retrieval class is intentionally *not* fork-safe because FAISS
+#      indexes are tricky to serialise across processes.  The pipeline should
+#      therefore instantiate Retrieval in the main process and share it across
+#      worker threads if batched retrieval is ever required.  This limitation
+#      is acceptable because top-k search for a single query is ~O(1 ms) for
+#      moderate corpus sizes with `IndexFlatIP`.
+#
+# 9. **Integration Points**  
+#      In `main.py` or `SEQAPipeline`:
+#
+#          if cfg.retrieval.enabled:
+#              retrieval = Retrieval(cfg, encoder)
+#              retrieval.index_corpus(cfg.retrieval.corpus_path)
+#          …
+#          if cfg.retrieval.enabled:
+#              passages = retrieval.retrieve(sample["question"],
+#                                            cfg.retrieval.top_k)
+#              long_document = " ".join(passages)
+#          else:
+#              long_document = sample["context"]
+#
+#      This string `long_document` is then passed to `Chunker.split()`.
+#
+# Edge Cases & Error Handling
+# ---------------------------
+# • Calling `retrieve()` before `index_corpus()` raises `RuntimeError`.
+# • If FAISS returns `-1` (no passage), we simply return an empty list; the
+#   caller must decide how to proceed (e.g., fall back to original context).
+# • If corpus size < k, we return as many passages as available.
+#
+# Hooks for Future Research
+# -------------------------
+# • **Re-ranker**: After FAISS search we could insert a cross-encoder
+#   re-ranker.  Not included because the paper explicitly sticks to *vector
+#   similarity*.
+# • **Adaptive top-k**: β-dependent threshold on similarity to dynamically
+#   decide k (mirroring Bayesian thresholding).  Out of scope but easy to add.
+#
+# References to `config.yaml`
+# ---------------------------
+#     retrieval:
+#       enabled: false          # toggles use
+#       top_k: 3                # default k
+#       corpus_path: data/wiki_paras.jsonl   # user provided
+#       save_path: data/wiki.faiss           # optional output
+#       force_rebuild: false    # ignore cache
+#
+# Anything outside these keys must *not* be auto-invented to stay faithful to
+# the instruction “Do not invent or assume any values”.
+#
+# End of Logic Analysis for retrieval.py
