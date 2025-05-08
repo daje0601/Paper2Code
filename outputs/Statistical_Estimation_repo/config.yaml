@@ -35,3 +35,14 @@ evaluation:
     - ROUGE_L
     - BERTScore
     - Perplexity
+
+python eval.py \
+    --paper_name Statistical_Estimation \
+    --pdf_json_path ../examples/Statistical_Estimation_cleaned.json \
+    --data_dir ../data \
+    --output_dir ../outputs/Statistical_Estimation \
+    --target_repo_dir ../outputs/Statistical_Estimation_repo \
+    --eval_result_dir ../results1 \
+    --eval_type ref_based \
+    --generated_n 8 \
+    --papercoder

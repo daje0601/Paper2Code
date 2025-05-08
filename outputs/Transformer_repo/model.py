@@ -470,3 +470,4 @@ class TransformerModel(nn.Module):
 
         loss = torch.mean(torch.sum(-true_dist * log_probs, dim=1))
         return loss
+
